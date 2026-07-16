@@ -67,7 +67,6 @@ internal sealed class IsoTpScheduler : IIsoTpScheduler
         }
     }
 
-    [Obsolete]
     public async Task RunAsync(CancellationToken ct)
     {
         _bus.FrameReceived += OnFrameReceived;
