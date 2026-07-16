@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -57,6 +57,7 @@ public sealed class QueuedCanBus : ICanBus, IAsyncDisposable
     // 统计
     private long _enqOk, _enqDrop, _drvAccepted, _drvBusy;
 
+    [Obsolete]
     public QueuedCanBus(ICanBus inner, QueuedCanBusOptions? opts = null)
     {
         _inner = inner ?? throw new ArgumentNullException(nameof(inner));
