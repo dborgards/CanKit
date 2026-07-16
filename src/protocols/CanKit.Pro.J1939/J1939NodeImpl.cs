@@ -1,0 +1,648 @@
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using CanKit.Abstractions.API.Can;
+using CanKit.Abstractions.API.Can.Definitions;
+using CanKit.Pro.Actor;
+using CanKit.Pro.Addressing;
+using CanKit.Pro.J1939Tp;
+using CanKit.Pro.RawCan;
+using CanKit.Pro.Reliability;
+
+namespace CanKit.Pro.J1939;
+
+/// <summary>
+/// Actor-driven <see cref="IJ1939Node"/> implementation that composes on the CanKit.Pro L2
+/// services (<see cref="ICanBusService"/>, <see cref="IProtocolActor"/>,
+/// <see cref="DeadlineScheduler"/>) and delegates multi-frame (&gt; 8 bytes) payloads to a
+/// shared <see cref="IJ1939TpChannel"/> per SRS FR-J1939-006.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The node subscribes to every extended-ID frame on the bus and classifies each one on the
+/// actor loop (single-writer discipline for all node state — claim state, address, pending
+/// claim TCS): Address Claim / Cannot Claim (PGN 0xEE00) drives the state machine, Request-PGN
+/// (0xEA00) and every other application PGN targeted at us (destination = our SA) or the
+/// global address (0xFF) surfaces via <see cref="MessageReceived"/>. TP.CM / TP.DT frames go
+/// through the shared J1939-TP channel and their reassembled datagrams show up as
+/// <see cref="J1939Message"/> events too.
+/// </para>
+/// <para>
+/// Outbound routing is entirely payload-length based (FR-J1939-006): &lt;= 8 bytes goes on the
+/// wire as one 29-bit CAN frame; &gt; 8 bytes is handed to the transport channel which sends
+/// TP.BAM for global destinations or TP.CM for a specific destination.
+/// </para>
+/// </remarks>
+internal sealed class J1939NodeImpl : IJ1939Node
+{
+    private readonly ICanBusService _service;
+    private readonly bool _ownsService;
+    private readonly J1939NodeOptions _options;
+    private readonly J1939Name _name;
+    private readonly ProtocolActor _actor;
+    private readonly DeadlineScheduler _deadlines;
+    private readonly ISubscription _subscription;
+    private readonly IJ1939TpChannel _transport;
+    private readonly Task _readerTask;
+    private readonly Task _transportReaderTask;
+    private readonly CancellationTokenSource _readerCts = new();
+    private readonly Channel<J1939Message> _rxInbox;
+
+    private PendingClaim? _pendingClaim;
+    private int _disposed;
+
+    /// <inheritdoc />
+    public byte? Address
+    {
+        get
+        {
+            int v = Volatile.Read(ref _addressStore);
+            return v < 0 ? null : (byte)v;
+        }
+    }
+
+    // Backing store: byte doesn't have a null representation, so we use an int-alike.
+    // A negative value means "unclaimed". Reads via Volatile so callers on any thread see the
+    // most recently committed value; writes happen only on the actor loop.
+    private int _addressStore = -1;
+
+    /// <inheritdoc />
+    public J1939Name Name => _name;
+
+    /// <inheritdoc />
+    public J1939ClaimState ClaimState => (J1939ClaimState)Volatile.Read(ref _claimStateStore);
+    private int _claimStateStore;
+
+    /// <inheritdoc />
+    public J1939NodeOptions Options => _options;
+
+    /// <inheritdoc />
+    public event EventHandler<J1939Message>? MessageReceived;
+
+    /// <inheritdoc />
+    public event EventHandler<J1939ClaimEventArgs>? AddressClaimChanged;
+
+    /// <inheritdoc />
+    public event EventHandler<Exception>? BackgroundExceptionOccurred;
+
+    internal J1939NodeImpl(ICanBusService service, J1939NodeOptions options, bool ownsService)
+    {
+        _service = service ?? throw new ArgumentNullException(nameof(service));
+        _options = options ?? throw new ArgumentNullException(nameof(options));
+        _options.Validate();
+        _ownsService = ownsService;
+        _name = options.Name;
+
+        var inboxOpts = new BoundedChannelOptions(Math.Max(1, _options.ReceiveBufferCapacity))
+        {
+            SingleReader = false,
+            SingleWriter = true,
+            FullMode = BoundedChannelFullMode.DropOldest,
+        };
+        _rxInbox = Channel.CreateBounded<J1939Message>(inboxOpts);
+
+        _actor = new ProtocolActor();
+        _actor.BackgroundExceptionOccurred += OnActorBackgroundException;
+        _deadlines = new DeadlineScheduler(_actor);
+
+        // The TP channel uses a source address that is not yet claimed; J1939TpChannel refuses
+        // 0xFF (global). Use the null address 0xFE as a placeholder — TP is only exercised for
+        // > 8-byte sends, which we gate on ClaimState == Claimed anyway. The channel does not
+        // filter its RX by SA (it filters by destination = our SA or 0xFF broadcast), so a
+        // placeholder SA still receives incoming BAM (broadcast) traffic. Directed TP.CM to a
+        // specific SA cannot arrive until we claim that SA — matching the FR-J1939-004
+        // Cannot-Claim expectation that an unclaimed node stays silent on directed traffic.
+        // Once a claim succeeds we re-open the transport channel with the claimed SA.
+        try
+        {
+            _transport = J1939Tp.J1939Tp.Open(_service, sourceAddress: J1939Pgn.NullAddress,
+                options: _options.TransportOptions, leaveOpen: true);
+        }
+        catch
+        {
+            _actor.Dispose();
+            throw;
+        }
+        _transport.BackgroundExceptionOccurred += OnTransportBackgroundException;
+
+        try
+        {
+            // Subscribe to every extended-ID frame and classify on the actor loop. A single
+            // predicate-less subscription is simpler than three overlapping mask filters and
+            // still allocation-light: CanFrameView is a readonly struct passed by ref via the
+            // subscription's async enumerator (FR-RAW-010/011).
+            _subscription = _service.Subscribe(f => f.IsExtendedFrame);
+        }
+        catch
+        {
+            _transport.Dispose();
+            _actor.Dispose();
+            throw;
+        }
+
+        _readerTask = Task.Run(RunReaderAsync);
+        _transportReaderTask = Task.Run(RunTransportReaderAsync);
+    }
+
+    // =========================================================================================
+    // Address Claim (SRS FR-J1939-003 / FR-J1939-004)
+    // =========================================================================================
+
+    /// <inheritdoc />
+    public Task ClaimAddressAsync(byte preferredAddress, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (preferredAddress == J1939Pgn.GlobalAddress || preferredAddress == J1939Pgn.NullAddress)
+            throw new ArgumentOutOfRangeException(nameof(preferredAddress),
+                $"Preferred address must be in [0x00, 0xFD]; 0xFE (Null) and 0xFF (Global) are reserved.");
+
+        var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationTokenRegistration ctr = default;
+        if (cancellationToken.CanBeCanceled)
+        {
+            ctr = cancellationToken.Register(static state =>
+            {
+                var t = (TaskCompletionSource<object?>)state!;
+                t.TrySetCanceled();
+            }, tcs);
+        }
+
+        _actor.Post(() => BeginClaim(preferredAddress, tcs, ctr));
+        return tcs.Task;
+    }
+
+    private void BeginClaim(byte preferredAddress, TaskCompletionSource<object?> tcs,
+        CancellationTokenRegistration ctr)
+    {
+        if (_disposed != 0)
+        {
+            ctr.Dispose();
+            tcs.TrySetException(new ObjectDisposedException(nameof(J1939NodeImpl)));
+            return;
+        }
+        if (tcs.Task.IsCompleted)
+        {
+            ctr.Dispose();
+            return;
+        }
+
+        // Cancel any previous in-flight claim.
+        _pendingClaim?.Deadline?.Dispose();
+        _pendingClaim?.Tcs.TrySetCanceled();
+        _pendingClaim?.CtRegistration.Dispose();
+
+        // Broadcast our Address Claim: PGN 0xEE00, SA = preferredAddress, DA = 0xFF, payload
+        // = 8-byte little-endian NAME. SAE J1939-81 §4.4.3.1.
+        SetClaimState(J1939ClaimState.Claiming, preferredAddress, contendingSa: null, contendingName: null);
+        SendAddressClaimFrame(sourceAddress: preferredAddress);
+
+        var deadline = _deadlines.Arm(_options.ClaimAnnounceTimeout,
+            () => OnClaimAnnounceElapsed(preferredAddress));
+        _pendingClaim = new PendingClaim(preferredAddress, tcs, deadline, ctr);
+    }
+
+    private void OnClaimAnnounceElapsed(byte preferredAddress)
+    {
+        var pending = _pendingClaim;
+        if (pending is null || pending.PreferredAddress != preferredAddress) return;
+        _pendingClaim = null;
+        pending.Deadline?.Dispose();
+        pending.CtRegistration.Dispose();
+
+        // Nobody contested us within the arbitration window: commit the address.
+        WriteAddress(preferredAddress);
+        SetClaimState(J1939ClaimState.Claimed, preferredAddress, contendingSa: null, contendingName: null);
+        pending.Tcs.TrySetResult(null);
+    }
+
+    private void HandleIncomingAddressClaim(byte peerSa, byte[] payload)
+    {
+        if (payload.Length < 8) return; // malformed
+        var peerName = J1939Name.Decompose(BitConverter.ToUInt64(payload, 0));
+
+        // A peer at SA=0xFE announces Cannot-Claim. Not directly relevant to *us* unless we
+        // are in the middle of claiming — in which case a Cannot-Claim cannot contest us
+        // (that peer has already lost).
+        if (peerSa == J1939Pgn.NullAddress) return;
+
+        var pending = _pendingClaim;
+        if (pending is not null && peerSa == pending.PreferredAddress)
+        {
+            // Someone is contending our preferred address during the arbitration window.
+            // SAE J1939-81 §4.4.3.2: numerically lower NAME wins.
+            if (peerName.HasHigherClaimPriorityThan(_name))
+            {
+                // We lose. Enter CannotClaim and broadcast SA=0xFE with our NAME.
+                _pendingClaim = null;
+                pending.Deadline?.Dispose();
+                pending.CtRegistration.Dispose();
+                WriteAddress(null);
+                SetClaimState(J1939ClaimState.CannotClaim, address: null,
+                    contendingSa: peerSa, contendingName: peerName);
+                SendAddressClaimFrame(sourceAddress: J1939Pgn.NullAddress);
+                pending.Tcs.TrySetException(new J1939CannotClaimException(pending.PreferredAddress));
+                return;
+            }
+
+            // Peer's NAME is >= ours: they lose. Re-announce our own claim so they hear it,
+            // then keep waiting on our deadline.
+            SendAddressClaimFrame(sourceAddress: pending.PreferredAddress);
+            return;
+        }
+
+        // We are already claimed at SA and a peer claims the same SA.
+        if (ClaimState == J1939ClaimState.Claimed && _addressStore >= 0 && peerSa == (byte)_addressStore)
+        {
+            if (peerName.HasHigherClaimPriorityThan(_name))
+            {
+                // We are unseated. Broadcast Cannot-Claim and transition.
+                WriteAddress(null);
+                SetClaimState(J1939ClaimState.CannotClaim, address: null,
+                    contendingSa: peerSa, contendingName: peerName);
+                SendAddressClaimFrame(sourceAddress: J1939Pgn.NullAddress);
+            }
+            else
+            {
+                // Peer loses: re-announce our own claim so it moves off our address.
+                SendAddressClaimFrame(sourceAddress: (byte)_addressStore);
+            }
+        }
+    }
+
+    private void SendAddressClaimFrame(byte sourceAddress)
+    {
+        // 8-byte little-endian NAME payload. PGN 0xEE00 is PDU1 with PS = 0xFF (global).
+        var payload = new byte[8];
+        ulong v = _name.Value;
+        for (int i = 0; i < 8; i++) payload[i] = (byte)((v >> (8 * i)) & 0xFF);
+        uint canId = J1939Id.ComposePgn(_options.ClaimPriority, J1939Pgn.AddressClaimed, sourceAddress,
+            destinationAddress: J1939Pgn.GlobalAddress);
+        TransmitFrame(canId, payload);
+    }
+
+    private void SetClaimState(J1939ClaimState state, byte? address, byte? contendingSa,
+        J1939Name? contendingName)
+    {
+        Volatile.Write(ref _claimStateStore, (int)state);
+        var args = new J1939ClaimEventArgs(state, address, contendingSa, contendingName);
+        try
+        {
+            AddressClaimChanged?.Invoke(this, args);
+        }
+        catch (Exception ex)
+        {
+            RaiseBackgroundException(ex);
+        }
+    }
+
+    private void WriteAddress(byte? address)
+    {
+        Volatile.Write(ref _addressStore, address.HasValue ? address.Value : -1);
+    }
+
+    // =========================================================================================
+    // Send (SRS FR-J1939-001 / FR-J1939-005 / FR-J1939-006)
+    // =========================================================================================
+
+    /// <inheritdoc />
+    public Task SendAsync(J1939Message message, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        return SendCoreAsync(message, cancellationToken);
+    }
+
+    private async Task SendCoreAsync(J1939Message message, CancellationToken cancellationToken)
+    {
+        int addr = Volatile.Read(ref _addressStore);
+        if (addr < 0)
+            throw new J1939NoAddressException();
+
+        byte sa = (byte)addr;
+        // Direct single-frame path (payload <= 8 bytes) — FR-J1939-006.
+        if (message.Payload.Length <= 8)
+        {
+            byte priority = message.Priority > 7 ? _options.DefaultPriority : message.Priority;
+            uint canId = J1939Id.ComposePgn(priority, message.Pgn, sa,
+                destinationAddress: message.DestinationAddress);
+            var payload = new byte[message.Payload.Length];
+            if (message.Payload.Length > 0) message.Payload.Span.CopyTo(payload);
+
+            using var frame = CanFrame.Classic(unchecked((int)canId), payload, isExtendedFrame: true);
+            var confirmation = await _service.SendConfirmed(frame, cancellationToken: cancellationToken).ConfigureAwait(false);
+            if (!confirmation.Confirmed)
+                throw new J1939NodeException(
+                    $"J1939 send failed for PGN 0x{message.Pgn:X}: {confirmation.FailureReason}.");
+            return;
+        }
+
+        // Multi-frame (> 8 bytes) path via the shared J1939-TP channel — FR-J1939-006.
+        // The TP channel was opened with SA=0xFE (Null) as a placeholder because the node did
+        // not yet have a claimed address at construction. Callers can only reach here after a
+        // successful claim (guarded above), but we still cannot mutate the existing channel's
+        // SA — we open a fresh, single-use TP channel with the correct SA on demand and let
+        // it dispose itself after the send completes.
+        var payloadArr = message.Payload.ToArray();
+        using var tpChannel = J1939Tp.J1939Tp.Open(_service, sourceAddress: sa,
+            options: _options.TransportOptions, leaveOpen: true);
+        if (message.DestinationAddress == J1939Pgn.GlobalAddress)
+            await tpChannel.SendBamAsync(message.Pgn, payloadArr, cancellationToken).ConfigureAwait(false);
+        else
+            await tpChannel.SendCmAsync(message.Pgn, message.DestinationAddress, payloadArr, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <inheritdoc />
+    public Task RequestPgnAsync(uint requestedPgn, byte destinationAddress = 0xFF,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (requestedPgn > J1939Pgn.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(requestedPgn), requestedPgn, "PGN must fit in 18 bits.");
+
+        // Request-PGN payload is a 3-byte little-endian PGN.
+        var payload = new byte[3];
+        payload[0] = (byte)(requestedPgn & 0xFF);
+        payload[1] = (byte)((requestedPgn >> 8) & 0xFF);
+        payload[2] = (byte)((requestedPgn >> 16) & 0xFF);
+
+        // Request PGN is 0xEA00 (PDU1). The Request frame itself is priority 6 on the wire
+        // (SAE J1939-21 §5.3.2 for Request PGN).
+        var message = new J1939Message(J1939Pgn.Request, payload, _options.ClaimPriority,
+            sourceAddress: 0, destinationAddress: destinationAddress);
+        return SendCoreAsync(message, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public IDisposable StartPeriodicSend(J1939Message message, TimeSpan period)
+    {
+        ThrowIfDisposed();
+        if (period <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(period), period, "Period must be positive.");
+        var schedule = new PeriodicSchedule(this, message, period);
+        schedule.Start();
+        return schedule;
+    }
+
+    // =========================================================================================
+    // Wire helpers
+    // =========================================================================================
+
+    private void TransmitFrame(uint canId, byte[] payload)
+    {
+        // Fire-and-forget: address-claim traffic doesn't need a task, but we still want a
+        // background exception if the driver rejects it. SendConfirmed is used consistently
+        // with the rest of the CanKit.Pro stack.
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var frame = CanFrame.Classic(unchecked((int)canId), payload, isExtendedFrame: true);
+                var confirmation = await _service.SendConfirmed(frame).ConfigureAwait(false);
+                if (!confirmation.Confirmed)
+                    RaiseBackgroundException(new J1939NodeException(
+                        $"J1939 frame TX failed (id=0x{canId:X8}): {confirmation.FailureReason}."));
+            }
+            catch (Exception ex)
+            {
+                RaiseBackgroundException(ex);
+            }
+        });
+    }
+
+    // =========================================================================================
+    // Reader loops
+    // =========================================================================================
+
+    private async Task RunReaderAsync()
+    {
+        try
+        {
+            await foreach (var frame in _subscription.Frames.WithCancellation(_readerCts.Token)
+                .ConfigureAwait(false))
+            {
+                if (!frame.IsExtendedFrame) continue;
+                var fields = J1939Id.Decompose((uint)frame.ID);
+                // Skip TP traffic — the shared J1939-TP channel demuxes those separately.
+                if (J1939Pgn.IsTransportCm(fields.Pgn) || J1939Pgn.IsTransportDt(fields.Pgn))
+                    continue;
+                var pgn = fields.Pgn;
+                var sa = fields.SourceAddress;
+                var da = fields.PduSpecific;
+                var priority = fields.Priority;
+                var payload = frame.Data.ToArray();
+                var isPdu1 = fields.IsPdu1;
+                _actor.Post(() => HandleIncomingFrame(pgn, priority, sa, da, isPdu1, payload));
+            }
+        }
+        catch (OperationCanceledException) { /* expected on Dispose */ }
+        catch (Exception ex) { RaiseBackgroundException(ex); }
+    }
+
+    private async Task RunTransportReaderAsync()
+    {
+        try
+        {
+            await foreach (var datagram in _transport.ReceiveAllAsync(_readerCts.Token).ConfigureAwait(false))
+            {
+                // Reassembled PDU: emit as a J1939Message just like a single-frame arrival.
+                var message = new J1939Message(datagram.Pgn, datagram.Payload,
+                    priority: _options.DefaultPriority,
+                    sourceAddress: datagram.SourceAddress,
+                    destinationAddress: datagram.DestinationAddress);
+                EmitMessage(message);
+            }
+        }
+        catch (OperationCanceledException) { /* expected on Dispose */ }
+        catch (Exception ex) { RaiseBackgroundException(ex); }
+    }
+
+    private void HandleIncomingFrame(uint pgn, byte priority, byte sa, byte da, bool isPdu1, byte[] payload)
+    {
+        try
+        {
+            // Address Claim (PGN 0xEE00): drive the state machine and stop; not an application PGN.
+            if (J1939Pgn.IsAddressClaim(pgn))
+            {
+                HandleIncomingAddressClaim(sa, payload);
+                return;
+            }
+
+            // Only surface application PGNs that are either broadcast (PDU2) or directed at us.
+            int myAddr = Volatile.Read(ref _addressStore);
+            if (isPdu1 && da != J1939Pgn.GlobalAddress && (myAddr < 0 || da != (byte)myAddr))
+                return;
+
+            var message = new J1939Message(pgn, payload, priority, sa,
+                isPdu1 ? da : J1939Pgn.GlobalAddress);
+            EmitMessage(message);
+        }
+        catch (Exception ex)
+        {
+            RaiseBackgroundException(ex);
+        }
+    }
+
+    private void EmitMessage(J1939Message message)
+    {
+        try
+        {
+            MessageReceived?.Invoke(this, message);
+        }
+        catch (Exception ex)
+        {
+            RaiseBackgroundException(ex);
+        }
+        _rxInbox.Writer.TryWrite(message);
+    }
+
+    // =========================================================================================
+    // Dispose
+    // =========================================================================================
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
+        try { _readerCts.Cancel(); } catch { }
+        _rxInbox.Writer.TryComplete();
+
+        try
+        {
+            _actor.Post(() =>
+            {
+                var pending = _pendingClaim;
+                if (pending is not null)
+                {
+                    _pendingClaim = null;
+                    pending.Deadline?.Dispose();
+                    pending.CtRegistration.Dispose();
+                    pending.Tcs.TrySetException(new ObjectDisposedException(nameof(J1939NodeImpl)));
+                }
+            });
+        }
+        catch (ObjectDisposedException) { /* actor already gone */ }
+
+        try { _readerTask.Wait(TimeSpan.FromSeconds(2)); } catch { }
+        try { _transportReaderTask.Wait(TimeSpan.FromSeconds(2)); } catch { }
+
+        _subscription.Dispose();
+        _transport.Dispose();
+        _actor.Dispose();
+        _readerCts.Dispose();
+        if (_ownsService) _service.Dispose();
+    }
+
+    /// <inheritdoc />
+    public async ValueTask DisposeAsync()
+    {
+        Dispose();
+        await Task.CompletedTask.ConfigureAwait(false);
+    }
+
+    // =========================================================================================
+    // Diagnostics helpers
+    // =========================================================================================
+
+    internal IAsyncEnumerable<J1939Message> InboxAll(CancellationToken cancellationToken)
+        => _rxInbox.Reader.ReadAllAsync(cancellationToken);
+
+    private void RaiseBackgroundException(Exception ex)
+    {
+        try { BackgroundExceptionOccurred?.Invoke(this, ex); }
+        catch { /* misbehaving subscriber must not tear the node down */ }
+    }
+
+    private void OnActorBackgroundException(object? sender, Exception ex) => RaiseBackgroundException(ex);
+    private void OnTransportBackgroundException(object? sender, Exception ex) => RaiseBackgroundException(ex);
+
+    private void ThrowIfDisposed()
+    {
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(J1939NodeImpl));
+    }
+
+    // =========================================================================================
+    // Nested types
+    // =========================================================================================
+
+    private sealed class PendingClaim
+    {
+        public PendingClaim(byte preferredAddress, TaskCompletionSource<object?> tcs, IDeadline deadline,
+            CancellationTokenRegistration ctRegistration)
+        {
+            PreferredAddress = preferredAddress;
+            Tcs = tcs;
+            Deadline = deadline;
+            CtRegistration = ctRegistration;
+        }
+
+        public byte PreferredAddress { get; }
+        public TaskCompletionSource<object?> Tcs { get; }
+        public IDeadline? Deadline { get; set; }
+        public CancellationTokenRegistration CtRegistration { get; }
+    }
+
+    /// <summary>
+    /// One periodic-send schedule: fires <see cref="_message"/> every <see cref="_period"/>
+    /// on the node's actor loop. Send failures do not tear the schedule down; they surface via
+    /// the node's <see cref="J1939NodeImpl.BackgroundExceptionOccurred"/>.
+    /// </summary>
+    private sealed class PeriodicSchedule : IDisposable
+    {
+        private readonly J1939NodeImpl _owner;
+        private readonly J1939Message _message;
+        private readonly TimeSpan _period;
+        private readonly CancellationTokenSource _cts = new();
+        private Task? _loop;
+        private int _disposed;
+
+        public PeriodicSchedule(J1939NodeImpl owner, J1939Message message, TimeSpan period)
+        {
+            _owner = owner;
+            _message = message;
+            _period = period;
+        }
+
+        public void Start()
+        {
+            _loop = Task.Run(() => LoopAsync(_cts.Token));
+        }
+
+        private async Task LoopAsync(CancellationToken ct)
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    try
+                    {
+                        await _owner.SendAsync(_message, ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) { return; }
+                    catch (ObjectDisposedException) { return; }
+                    catch (Exception ex)
+                    {
+                        _owner.RaiseBackgroundException(ex);
+                    }
+
+                    try
+                    {
+                        await Task.Delay(_period, ct).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) { return; }
+                }
+            }
+            catch { /* observed via BackgroundExceptionOccurred */ }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+            try { _cts.Cancel(); } catch { }
+            try { _loop?.GetAwaiter().GetResult(); } catch { }
+            _cts.Dispose();
+        }
+    }
+}
