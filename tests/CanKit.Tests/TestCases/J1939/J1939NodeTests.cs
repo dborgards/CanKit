@@ -399,6 +399,128 @@ public class J1939NodeTests : IClassFixture<TestCaseProvider>
         Volatile.Read(ref tpCmSeen).Should().BeGreaterThan(0,
             ">8-byte payload must route through J1939-TP (a TP.CM announce must appear on the bus)");
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Bugbot 3600377721 regression: after a successful address claim the node MUST accept
+    // directed TP.CM traffic to the claimed SA. Before the fix J1939NodeImpl kept its internal
+    // IJ1939TpChannel bound to the 0xFE placeholder SA even after ClaimState==Claimed, so
+    // J1939TpChannel's `destination == SA || 0xFF` filter dropped every directed CM to the
+    // claimed address.
+    // ---------------------------------------------------------------------------------------
+    [Fact]
+    public async Task DirectedTpCm_ToClaimedAddress_IsReceivedAfterClaim()
+    {
+        var session = NewSession();
+        using var busA = Open(session, 0); // peer: raw J1939-TP sender
+        using var busB = Open(session, 1); // node under test
+
+        // The receiver is a J1939 node — the whole point is to verify the *node* reassembles
+        // and surfaces the directed multi-frame PDU on MessageReceived.
+        using var receiver = J1939Node.Open(busB, new J1939NodeOptions(Name(2))
+        {
+            TransportOptions = new J1939TpOptions().With(th: TimeSpan.FromMilliseconds(5)),
+        });
+        await receiver.ClaimAddressAsync(0xA0).WithTimeout(ShortTimeout);
+        receiver.ClaimState.Should().Be(J1939ClaimState.Claimed);
+        receiver.Address.Should().Be((byte)0xA0);
+
+        // Peer sends a directed TP.CM (>8 bytes) targeting the claimed SA 0xA0. Uses a raw
+        // J1939-TP channel from a different SA so the frames actually travel across the
+        // virtual bus and hit the node's transport RX filter.
+        using var peerTp = CanKit.Pro.J1939Tp.J1939Tp.Open(busA, sourceAddress: 0x55,
+            new J1939TpOptions().With(th: TimeSpan.FromMilliseconds(5)));
+
+        var payload = new byte[24];
+        for (int i = 0; i < payload.Length; i++) payload[i] = (byte)(0xB0 + i);
+
+        var recvTask = WaitForMessageAsync(receiver,
+            m => m.Pgn == 0xEF00u && m.Payload.Length == payload.Length && m.SourceAddress == 0x55,
+            ShortTimeout);
+
+        await peerTp.SendCmAsync(pgn: 0xEF00u, destinationAddress: 0xA0, payload)
+            .WithTimeout(ShortTimeout);
+
+        var received = await recvTask;
+        received.Payload.ToArray().Should().Equal(payload);
+        received.SourceAddress.Should().Be(0x55);
+        received.DestinationAddress.Should().Be(0xA0);
+        received.WasMultiFrame.Should().BeTrue();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Bugbot 3600377725 regression: starting a fresh ClaimAddressAsync on an already-claimed
+    // node MUST invalidate the old SA immediately. SendAsync must reject application traffic
+    // (throw J1939NoAddressException) until the new claim reaches Claimed again, otherwise the
+    // node keeps transmitting with the old SA while its address-claim frame advertises a
+    // different preferred one on the wire.
+    // ---------------------------------------------------------------------------------------
+    [Fact]
+    public async Task ReClaim_RejectsSendUntilNewClaimSucceeds()
+    {
+        var session = NewSession();
+        using var busA = Open(session, 0);
+        using var busB = Open(session, 1); // spectator: watches which SAs appear on the wire
+
+        // Give the arbitration window enough room that we can observe the mid-claim gap even on
+        // a fast Virtual bus. 500 ms is well above CI jitter but short enough to keep the test
+        // fast.
+        var opts = new J1939NodeOptions(Name(1))
+        {
+            ClaimAnnounceTimeout = TimeSpan.FromMilliseconds(500),
+        };
+        using var node = J1939Node.Open(busA, opts);
+
+        // Initial claim -> we hold 0x11.
+        await node.ClaimAddressAsync(0x11).WithTimeout(ShortTimeout);
+        node.ClaimState.Should().Be(J1939ClaimState.Claimed);
+
+        // A send with the initial claim succeeds; SA on the wire must be 0x11.
+        byte? observedSa = null;
+        busB.FrameObserved += (_, e) =>
+        {
+            if (!e.CanFrame.IsExtendedFrame) return;
+            var fields = J1939Id.Decompose((uint)e.CanFrame.ID);
+            if (fields.Pgn == 0xFEF3u) observedSa = fields.SourceAddress;
+        };
+        await node.SendAsync(new J1939Message(0xFEF3u, new byte[] { 1, 2, 3 })).WithTimeout(ShortTimeout);
+        await Task.Delay(50);
+        observedSa.Should().Be((byte)0x11);
+
+        // Start a re-claim to a different preferred SA — do NOT await yet so we can inspect
+        // the mid-claim behavior. The state must transition out of Claimed immediately.
+        var reclaimTask = node.ClaimAddressAsync(0x22);
+
+        // Give the actor a beat to process BeginClaim.
+        for (int i = 0; i < 20 && node.ClaimState == J1939ClaimState.Claimed; i++)
+            await Task.Delay(10);
+        node.ClaimState.Should().NotBe(J1939ClaimState.Claimed,
+            "starting a new claim must clear the previous Claimed state so old-SA traffic is gated off");
+        node.Address.Should().BeNull(
+            "the previous claimed address must be invalidated before the new preferred SA is announced");
+
+        // SendAsync MUST reject application traffic while the claim is in-flight. Before the
+        // fix, SendCoreAsync only checked _addressStore >= 0, so this send would silently go
+        // out with the *previous* SA (0x11) while claim frames advertised 0x22.
+        Func<Task> sendMidClaim = () => node.SendAsync(new J1939Message(0xFEF4u, new byte[] { 4, 5, 6 }));
+        await sendMidClaim.Should().ThrowAsync<J1939NoAddressException>();
+
+        // Once the new claim completes, application traffic MUST resume on the new SA.
+        await reclaimTask.WithTimeout(ShortTimeout);
+        node.ClaimState.Should().Be(J1939ClaimState.Claimed);
+        node.Address.Should().Be((byte)0x22);
+
+        byte? postSa = null;
+        busB.FrameObserved += (_, e) =>
+        {
+            if (!e.CanFrame.IsExtendedFrame) return;
+            var fields = J1939Id.Decompose((uint)e.CanFrame.ID);
+            if (fields.Pgn == 0xFEF5u) postSa = fields.SourceAddress;
+        };
+        await node.SendAsync(new J1939Message(0xFEF5u, new byte[] { 7, 8, 9 }))
+            .WithTimeout(ShortTimeout);
+        await Task.Delay(50);
+        postSa.Should().Be((byte)0x22);
+    }
 }
 
 internal static class J1939NodeTestExtensions

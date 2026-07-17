@@ -44,9 +44,13 @@ internal sealed class J1939NodeImpl : IJ1939Node
     private readonly ProtocolActor _actor;
     private readonly DeadlineScheduler _deadlines;
     private readonly ISubscription _subscription;
-    private readonly IJ1939TpChannel _transport;
+    // The transport channel and its reader task are recreated whenever the node's own SA
+    // changes: J1939TpChannel binds its RX destination filter to the SA at construction, so
+    // after a successful claim we must re-open the channel on the claimed SA (Bugbot
+    // 3600377721). Mutation of these two fields only happens on the actor loop.
+    private IJ1939TpChannel _transport = null!;
+    private Task _transportReaderTask = null!;
     private readonly Task _readerTask;
-    private readonly Task _transportReaderTask;
     private readonly CancellationTokenSource _readerCts = new();
     private readonly Channel<J1939Message> _rxInbox;
 
@@ -107,14 +111,12 @@ internal sealed class J1939NodeImpl : IJ1939Node
         _actor.BackgroundExceptionOccurred += OnActorBackgroundException;
         _deadlines = new DeadlineScheduler(_actor);
 
-        // The TP channel uses a source address that is not yet claimed; J1939TpChannel refuses
-        // 0xFF (global). Use the null address 0xFE as a placeholder — TP is only exercised for
-        // > 8-byte sends, which we gate on ClaimState == Claimed anyway. The channel does not
-        // filter its RX by SA (it filters by destination = our SA or 0xFF broadcast), so a
-        // placeholder SA still receives incoming BAM (broadcast) traffic. Directed TP.CM to a
-        // specific SA cannot arrive until we claim that SA — matching the FR-J1939-004
-        // Cannot-Claim expectation that an unclaimed node stays silent on directed traffic.
-        // Once a claim succeeds we re-open the transport channel with the claimed SA.
+        // The TP channel is initially bound to the null address 0xFE because the node does not
+        // yet have a claimed SA. Its RX destination filter is `destination == our SA || 0xFF`,
+        // so at 0xFE it still receives BAM (broadcast, DA=0xFF) traffic — but directed TP.CM
+        // to a *claimed* address cannot arrive until we re-open the channel with that SA
+        // (Bugbot 3600377721). RebindTransportOnLoop does exactly that at each ClaimState
+        // transition; here we just seed the initial placeholder channel.
         try
         {
             _transport = J1939Tp.J1939Tp.Open(_service, sourceAddress: J1939Pgn.NullAddress,
@@ -143,7 +145,7 @@ internal sealed class J1939NodeImpl : IJ1939Node
         }
 
         _readerTask = Task.Run(RunReaderAsync);
-        _transportReaderTask = Task.Run(RunTransportReaderAsync);
+        _transportReaderTask = StartTransportReader(_transport);
     }
 
     // =========================================================================================
@@ -193,6 +195,17 @@ internal sealed class J1939NodeImpl : IJ1939Node
         _pendingClaim?.Tcs.TrySetCanceled();
         _pendingClaim?.CtRegistration.Dispose();
 
+        // Invalidate any previously-claimed address *before* announcing the new preferred SA:
+        // application traffic must not race and go out on the old SA while the wire already
+        // advertises a different preferred address. SendCoreAsync gates on ClaimState==Claimed
+        // as well, but clearing the address here also makes the Address getter honest during
+        // the arbitration window (Bugbot 3600377725).
+        WriteAddress(null);
+        // Unbind the transport from any prior claimed SA so we do not accept directed TP.CM
+        // for the old address during the new arbitration window. Placeholder 0xFE still
+        // receives broadcast TP.BAM traffic.
+        RebindTransportOnLoop(J1939Pgn.NullAddress);
+
         // Broadcast our Address Claim: PGN 0xEE00, SA = preferredAddress, DA = 0xFF, payload
         // = 8-byte little-endian NAME. SAE J1939-81 §4.4.3.1.
         SetClaimState(J1939ClaimState.Claiming, preferredAddress, contendingSa: null, contendingName: null);
@@ -213,6 +226,10 @@ internal sealed class J1939NodeImpl : IJ1939Node
 
         // Nobody contested us within the arbitration window: commit the address.
         WriteAddress(preferredAddress);
+        // Rebind the TP channel to the claimed SA so directed TP.CM/TP.DT to us gets accepted
+        // (its RX filter is `destination == SA || 0xFF broadcast`; a 0xFE placeholder drops
+        // directed traffic — Bugbot 3600377721).
+        RebindTransportOnLoop(preferredAddress);
         SetClaimState(J1939ClaimState.Claimed, preferredAddress, contendingSa: null, contendingName: null);
         pending.Tcs.TrySetResult(null);
     }
@@ -239,6 +256,9 @@ internal sealed class J1939NodeImpl : IJ1939Node
                 pending.Deadline?.Dispose();
                 pending.CtRegistration.Dispose();
                 WriteAddress(null);
+                // TP channel goes back to placeholder 0xFE — no directed TP traffic reaches
+                // us while unclaimed.
+                RebindTransportOnLoop(J1939Pgn.NullAddress);
                 SetClaimState(J1939ClaimState.CannotClaim, address: null,
                     contendingSa: peerSa, contendingName: peerName);
                 SendAddressClaimFrame(sourceAddress: J1939Pgn.NullAddress);
@@ -259,6 +279,7 @@ internal sealed class J1939NodeImpl : IJ1939Node
             {
                 // We are unseated. Broadcast Cannot-Claim and transition.
                 WriteAddress(null);
+                RebindTransportOnLoop(J1939Pgn.NullAddress);
                 SetClaimState(J1939ClaimState.CannotClaim, address: null,
                     contendingSa: peerSa, contendingName: peerName);
                 SendAddressClaimFrame(sourceAddress: J1939Pgn.NullAddress);
@@ -315,6 +336,12 @@ internal sealed class J1939NodeImpl : IJ1939Node
 
     private async Task SendCoreAsync(J1939Message message, CancellationToken cancellationToken)
     {
+        // Gate strictly on ClaimState==Claimed (Bugbot 3600377725): checking only that the
+        // address store is non-negative would let application traffic go out on the previous
+        // SA during a re-claim, while the wire already advertises a different preferred
+        // address. BeginClaim clears the address as well, so both gates fail closed.
+        if ((J1939ClaimState)Volatile.Read(ref _claimStateStore) != J1939ClaimState.Claimed)
+            throw new J1939NoAddressException();
         int addr = Volatile.Read(ref _addressStore);
         if (addr < 0)
             throw new J1939NoAddressException();
@@ -338,18 +365,31 @@ internal sealed class J1939NodeImpl : IJ1939Node
         }
 
         // Multi-frame (> 8 bytes) path via the shared J1939-TP channel — FR-J1939-006.
-        // The TP channel was opened with SA=0xFE (Null) as a placeholder because the node did
-        // not yet have a claimed address at construction. Callers can only reach here after a
-        // successful claim (guarded above), but we still cannot mutate the existing channel's
-        // SA — we open a fresh, single-use TP channel with the correct SA on demand and let
-        // it dispose itself after the send completes.
-        var payloadArr = message.Payload.ToArray();
-        using var tpChannel = J1939Tp.J1939Tp.Open(_service, sourceAddress: sa,
-            options: _options.TransportOptions, leaveOpen: true);
-        if (message.DestinationAddress == J1939Pgn.GlobalAddress)
-            await tpChannel.SendBamAsync(message.Pgn, payloadArr, cancellationToken).ConfigureAwait(false);
-        else
-            await tpChannel.SendCmAsync(message.Pgn, message.DestinationAddress, payloadArr, cancellationToken).ConfigureAwait(false);
+        // After a successful claim RebindTransportOnLoop re-opens _transport on the claimed
+        // SA, so it is safe to use directly for both TX (peer sees the correct SA on RTS/DT)
+        // and RX (CTS/EOM from the peer come back to this same channel).
+        var tpChannel = _transport;
+        if (tpChannel.SourceAddress != sa)
+        {
+            // Rebind hasn't landed yet (would be a claim/send race on the actor loop) — fall
+            // back to a single-use per-send TP channel bound to the currently-claimed SA so
+            // the wire carries the right SA regardless.
+            tpChannel = J1939Tp.J1939Tp.Open(_service, sourceAddress: sa,
+                options: _options.TransportOptions, leaveOpen: true);
+        }
+        try
+        {
+            var payloadArr = message.Payload.ToArray();
+            if (message.DestinationAddress == J1939Pgn.GlobalAddress)
+                await tpChannel.SendBamAsync(message.Pgn, payloadArr, cancellationToken).ConfigureAwait(false);
+            else
+                await tpChannel.SendCmAsync(message.Pgn, message.DestinationAddress, payloadArr, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            if (!ReferenceEquals(tpChannel, _transport))
+                tpChannel.Dispose();
+        }
     }
 
     /// <inheritdoc />
@@ -439,11 +479,17 @@ internal sealed class J1939NodeImpl : IJ1939Node
         catch (Exception ex) { RaiseBackgroundException(ex); }
     }
 
-    private async Task RunTransportReaderAsync()
+    private Task StartTransportReader(IJ1939TpChannel transport)
+        => Task.Run(() => RunTransportReaderAsync(transport));
+
+    // Bound to a specific transport instance so a rebind (which replaces _transport) does not
+    // accidentally cause an already-running reader to switch enumerables mid-flight. The
+    // per-instance inbox completes on channel Dispose, so this loop exits cleanly on rebind.
+    private async Task RunTransportReaderAsync(IJ1939TpChannel transport)
     {
         try
         {
-            await foreach (var datagram in _transport.ReceiveAllAsync(_readerCts.Token).ConfigureAwait(false))
+            await foreach (var datagram in transport.ReceiveAllAsync(_readerCts.Token).ConfigureAwait(false))
             {
                 // Reassembled PDU: emit as a J1939Message just like a single-frame arrival.
                 var message = new J1939Message(datagram.Pgn, datagram.Payload,
@@ -454,7 +500,52 @@ internal sealed class J1939NodeImpl : IJ1939Node
             }
         }
         catch (OperationCanceledException) { /* expected on Dispose */ }
+        catch (ObjectDisposedException) { /* expected on rebind: old channel was disposed */ }
         catch (Exception ex) { RaiseBackgroundException(ex); }
+    }
+
+    /// <summary>
+    /// Re-open <see cref="_transport"/> on <paramref name="sourceAddress"/>. Must run on the
+    /// actor loop (single-writer discipline for <c>_transport</c> / <c>_transportReaderTask</c>).
+    /// A no-op if the current channel already carries the requested SA. On failure the old
+    /// channel is retained and the exception is surfaced via
+    /// <see cref="BackgroundExceptionOccurred"/>.
+    /// </summary>
+    private void RebindTransportOnLoop(byte sourceAddress)
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+        var current = _transport;
+        if (current is not null && current.SourceAddress == sourceAddress) return;
+
+        IJ1939TpChannel newTransport;
+        try
+        {
+            newTransport = J1939Tp.J1939Tp.Open(_service, sourceAddress: sourceAddress,
+                options: _options.TransportOptions, leaveOpen: true);
+        }
+        catch (Exception ex)
+        {
+            // Keep the old channel; upstream state transitions still succeed but directed TP
+            // to the new SA will remain silent. Surface so the application can react.
+            RaiseBackgroundException(ex);
+            return;
+        }
+
+        newTransport.BackgroundExceptionOccurred += OnTransportBackgroundException;
+        _transport = newTransport;
+        _transportReaderTask = StartTransportReader(newTransport);
+
+        // Dispose the old channel off-loop: J1939TpChannel.Dispose synchronously waits up to
+        // 2 s for its own reader to drain, which we do not want to hold the actor thread for.
+        if (current is not null)
+        {
+            current.BackgroundExceptionOccurred -= OnTransportBackgroundException;
+            _ = Task.Run(() =>
+            {
+                try { current.Dispose(); }
+                catch (Exception ex) { RaiseBackgroundException(ex); }
+            });
+        }
     }
 
     private void HandleIncomingFrame(uint pgn, byte priority, byte sa, byte da, bool isPdu1, byte[] payload)
