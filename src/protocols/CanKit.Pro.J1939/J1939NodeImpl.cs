@@ -258,6 +258,9 @@ internal sealed class J1939NodeImpl : IJ1939Node
         // as well, but clearing the address here also makes the Address getter honest during
         // the arbitration window (Bugbot 3600377725).
         WriteAddress(null);
+        // Publish Claiming *before* the (potentially long) transport rebind so observers never
+        // see ClaimState==Claimed with Address==null during a re-claim (Bugbot 3600717316).
+        SetClaimState(J1939ClaimState.Claiming, preferredAddress, contendingSa: null, contendingName: null);
         // Unbind the transport from any prior claimed address so we do not accept directed
         // TP.CM for the old address during the new arbitration window. Placeholder 0xFE still
         // receives broadcast TP.BAM traffic.
@@ -265,7 +268,6 @@ internal sealed class J1939NodeImpl : IJ1939Node
 
         // Broadcast our Address Claim: PGN 0xEE00, SA = preferredAddress, DA = 0xFF, payload
         // = 8-byte little-endian NAME. SAE J1939-81 §4.4.3.1.
-        SetClaimState(J1939ClaimState.Claiming, preferredAddress, contendingSa: null, contendingName: null);
         SendAddressClaimFrame(sourceAddress: preferredAddress);
 
         var deadline = _deadlines.Arm(_options.ClaimAnnounceTimeout,
@@ -322,6 +324,12 @@ internal sealed class J1939NodeImpl : IJ1939Node
     {
         if (payload.Length < 8) return; // malformed
         var peerName = J1939Name.Decompose(BitConverter.ToUInt64(payload, 0));
+
+        // Own transmit echo (or an identical NAME on the bus) must not be treated as a losing
+        // peer — equal NAME fails HasHigherClaimPriorityThan and would re-announce forever on
+        // ChannelWorkMode.Echo adapters (Bugbot 3600783801). CanFrameView has no IsEcho bit,
+        // so NAME equality is the reliable local-TX filter for Address Claim.
+        if (peerName.Value == _name.Value) return;
 
         // A peer at SA=0xFE announces Cannot-Claim. Not directly relevant to *us* unless we
         // are in the middle of claiming — in which case a Cannot-Claim cannot contest us
@@ -612,6 +620,11 @@ internal sealed class J1939NodeImpl : IJ1939Node
         {
             await foreach (var datagram in transport.ReceiveAllAsync(_readerCts.Token).ConfigureAwait(false))
             {
+                // Drop datagrams from a channel that has already been replaced by rebind
+                // (we no longer Wait the old reader on the actor — Bugbot 3600717311).
+                if (!ReferenceEquals(transport, _transport))
+                    return;
+
                 // Reassembled PDU: emit as a J1939Message just like a single-frame arrival.
                 // `IJ1939Node.MessageReceived` documents that handlers run on the node's actor
                 // loop; the transport reader is a separate Task, so we must marshal onto the
@@ -623,7 +636,11 @@ internal sealed class J1939NodeImpl : IJ1939Node
                     destinationAddress: datagram.DestinationAddress);
                 try
                 {
-                    _actor.Post(() => EmitMessage(message));
+                    _actor.Post(() =>
+                    {
+                        if (!ReferenceEquals(transport, _transport)) return;
+                        EmitMessage(message);
+                    });
                 }
                 catch (ObjectDisposedException)
                 {
@@ -650,9 +667,9 @@ internal sealed class J1939NodeImpl : IJ1939Node
     /// with opening a fresh channel leaves both TP channels subscribed to the bus at the
     /// same time; broadcast TP.BAM (DA = 0xFF) is accepted by both channels and both fire
     /// reassembled datagrams, so <see cref="MessageReceived"/> sees each multi-frame BAM
-    /// once per surviving channel. <see cref="IJ1939TpChannel"/>.Dispose caps its internal
-    /// reader-drain wait at ~2 s (see <c>J1939TpChannel.Dispose</c>), and cancelling the
-    /// bus subscription is effectively instant, so the resulting actor stall is bounded.
+    /// once per surviving channel. Dispose itself only cancels the bus subscription (fast);
+    /// we deliberately do not <c>Wait</c> the old reader on the actor (Bugbot 3600717311) —
+    /// stale posts are filtered by channel identity instead.
     /// If <c>J1939Tp.Open</c> then fails, the exception is surfaced via
     /// <see cref="BackgroundExceptionOccurred"/> — <c>_transport</c> continues to point at
     /// the now-disposed old channel so subsequent TP sends fail loudly rather than
@@ -667,16 +684,15 @@ internal sealed class J1939NodeImpl : IJ1939Node
         // Tear down the previous transport BEFORE opening the new one so no window exists
         // where two subscribed channels can both surface the same broadcast TP.BAM
         // (Bugbot 3600591973). Disposing the channel cancels its bus subscription
-        // immediately and completes its inbox, which lets our per-transport reader loop
-        // exit; we then briefly wait on that reader so it cannot post a stale EmitMessage
-        // for an old-SA datagram after this method returns.
+        // immediately and completes its inbox. Do NOT Wait on the reader here — that would
+        // stall the single ProtocolActor for up to ~2 s and block address-claim handling
+        // (Bugbot 3600717311). Late datagrams from the old reader are dropped via the
+        // ReferenceEquals(transport, _transport) gate in RunTransportReaderAsync.
         if (current is not null)
         {
             current.BackgroundExceptionOccurred -= OnTransportBackgroundException;
             try { current.Dispose(); }
             catch (Exception ex) { RaiseBackgroundException(ex); }
-            try { _transportReaderTask.Wait(TimeSpan.FromSeconds(2)); }
-            catch { /* observed via task; transport reader swallows OCE/ODE by design */ }
         }
 
         IJ1939TpChannel newTransport;
