@@ -266,13 +266,12 @@ internal sealed class J1939NodeImpl : IJ1939Node
         // receives broadcast TP.BAM traffic.
         RebindTransportOnLoop(J1939Pgn.NullAddress);
 
-        // Broadcast our Address Claim: PGN 0xEE00, SA = preferredAddress, DA = 0xFF, payload
-        // = 8-byte little-endian NAME. SAE J1939-81 §4.4.3.1.
-        SendAddressClaimFrame(sourceAddress: preferredAddress);
-
-        var deadline = _deadlines.Arm(_options.ClaimAnnounceTimeout,
-            () => OnClaimAnnounceElapsed(preferredAddress));
-        _pendingClaim = new PendingClaim(preferredAddress, tcs, deadline, ctr);
+        // Register the pending claim *before* TX so contending peers that arrive during the
+        // SendConfirmed await are still handled. Arm the arbitration deadline only after the
+        // claim frame is confirmed on the bus — otherwise a failed/slow TX would still let
+        // OnClaimAnnounceElapsed commit Claimed (Bugbot 3600799903).
+        _pendingClaim = new PendingClaim(preferredAddress, tcs, deadline: null, ctr);
+        TransmitAddressClaimConfirmed(sourceAddress: preferredAddress);
     }
 
     private void OnClaimAnnounceElapsed(byte preferredAddress)
@@ -318,6 +317,43 @@ internal sealed class J1939NodeImpl : IJ1939Node
         RebindTransportOnLoop(preferredAddress);
         SetClaimState(J1939ClaimState.Claimed, preferredAddress, contendingSa: null, contendingName: null);
         pending.Tcs.TrySetResult(null);
+    }
+
+    private void OnClaimAnnounceTxConfirmed(byte preferredAddress)
+    {
+        var pending = _pendingClaim;
+        if (pending is null || pending.PreferredAddress != preferredAddress) return;
+        if (pending.Tcs.Task.IsCompleted) return;
+        if (pending.Deadline is not null) return; // already armed (defensive)
+        if ((J1939ClaimState)Volatile.Read(ref _claimStateStore) != J1939ClaimState.Claiming)
+            return;
+
+        // Arbitration window starts only after the claim announcement is on the wire.
+        pending.Deadline = _deadlines.Arm(_options.ClaimAnnounceTimeout,
+            () => OnClaimAnnounceElapsed(preferredAddress));
+    }
+
+    private void OnClaimAnnounceTxFailed(byte preferredAddress, Exception error)
+    {
+        var pending = _pendingClaim;
+        if (pending is null || pending.PreferredAddress != preferredAddress) return;
+
+        _pendingClaim = null;
+        pending.Deadline?.Dispose();
+        pending.CtRegistration.Dispose();
+
+        if ((J1939ClaimState)Volatile.Read(ref _claimStateStore) == J1939ClaimState.Claiming)
+        {
+            WriteAddress(null);
+            RebindTransportOnLoop(J1939Pgn.NullAddress);
+            SetClaimState(J1939ClaimState.NotClaimed, address: null,
+                contendingSa: null, contendingName: null);
+        }
+
+        pending.Tcs.TrySetException(error is J1939NodeException
+            ? error
+            : new J1939NodeException(
+                $"J1939 address claim TX failed for SA 0x{preferredAddress:X2}.", error));
     }
 
     private void HandleIncomingAddressClaim(byte peerSa, byte[] payload)
@@ -387,12 +423,57 @@ internal sealed class J1939NodeImpl : IJ1939Node
     private void SendAddressClaimFrame(byte sourceAddress)
     {
         // 8-byte little-endian NAME payload. PGN 0xEE00 is PDU1 with PS = 0xFF (global).
-        var payload = new byte[8];
-        ulong v = _name.Value;
-        for (int i = 0; i < 8; i++) payload[i] = (byte)((v >> (8 * i)) & 0xFF);
+        // Re-announcements / Cannot-Claim remain fire-and-forget; the initial claim path uses
+        // TransmitAddressClaimConfirmed so ClaimAddressAsync cannot succeed without TX confirm.
+        var payload = BuildAddressClaimPayload();
         uint canId = J1939Id.ComposePgn(_options.ClaimPriority, J1939Pgn.AddressClaimed, sourceAddress,
             destinationAddress: J1939Pgn.GlobalAddress);
         TransmitFrame(canId, payload);
+    }
+
+    private byte[] BuildAddressClaimPayload()
+    {
+        var payload = new byte[8];
+        ulong v = _name.Value;
+        for (int i = 0; i < 8; i++) payload[i] = (byte)((v >> (8 * i)) & 0xFF);
+        return payload;
+    }
+
+    /// <summary>
+    /// Sends the initial Address Claim with <see cref="ICanBusService.SendConfirmed"/> and
+    /// posts success/failure back onto the actor so the arbitration deadline is armed only
+    /// after a confirmed TX (Bugbot 3600799903).
+    /// </summary>
+    private void TransmitAddressClaimConfirmed(byte sourceAddress)
+    {
+        var payload = BuildAddressClaimPayload();
+        uint canId = J1939Id.ComposePgn(_options.ClaimPriority, J1939Pgn.AddressClaimed, sourceAddress,
+            destinationAddress: J1939Pgn.GlobalAddress);
+        byte preferred = sourceAddress;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                using var frame = CanFrame.Classic(unchecked((int)canId), payload, isExtendedFrame: true);
+                var confirmation = await _service.SendConfirmed(frame).ConfigureAwait(false);
+                if (!confirmation.Confirmed)
+                {
+                    var ex = new J1939NodeException(
+                        $"J1939 address claim TX failed (id=0x{canId:X8}): {confirmation.FailureReason}.");
+                    try { _actor.Post(() => OnClaimAnnounceTxFailed(preferred, ex)); }
+                    catch (ObjectDisposedException) { }
+                    return;
+                }
+
+                try { _actor.Post(() => OnClaimAnnounceTxConfirmed(preferred)); }
+                catch (ObjectDisposedException) { }
+            }
+            catch (Exception ex)
+            {
+                try { _actor.Post(() => OnClaimAnnounceTxFailed(preferred, ex)); }
+                catch (ObjectDisposedException) { }
+            }
+        });
     }
 
     private void SetClaimState(J1939ClaimState state, byte? address, byte? contendingSa,
@@ -841,7 +922,7 @@ internal sealed class J1939NodeImpl : IJ1939Node
 
     private sealed class PendingClaim
     {
-        public PendingClaim(byte preferredAddress, TaskCompletionSource<object?> tcs, IDeadline deadline,
+        public PendingClaim(byte preferredAddress, TaskCompletionSource<object?> tcs, IDeadline? deadline,
             CancellationTokenRegistration ctRegistration)
         {
             PreferredAddress = preferredAddress;
