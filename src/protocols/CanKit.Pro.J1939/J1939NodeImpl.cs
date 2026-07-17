@@ -317,9 +317,13 @@ internal sealed class J1939NodeImpl : IJ1939Node
         // broken while Address looks valid (Bugbot 3600825931).
         if (!RebindTransportOnLoop(preferredAddress))
         {
+            // We already announced preferredAddress on the bus; peers may treat it as ours.
+            // Broadcast Cannot-Claim (SA 0xFE) so the orphaned announcement is retracted
+            // (Bugbot 3600845832), then leave the node unclaimed.
             WriteAddress(null);
-            SetClaimState(J1939ClaimState.NotClaimed, address: null,
+            SetClaimState(J1939ClaimState.CannotClaim, address: null,
                 contendingSa: null, contendingName: null);
+            SendAddressClaimFrame(sourceAddress: J1939Pgn.NullAddress);
             pending.Tcs.TrySetException(new J1939NodeException(
                 $"J1939 claim succeeded on the wire but TP rebind to SA 0x{preferredAddress:X2} failed."));
             return;
