@@ -353,6 +353,29 @@ public class J1939NodeTests : IClassFixture<TestCaseProvider>
             "exactly one direct 29-bit frame must carry the PGN");
     }
 
+    [Fact]
+    public async Task Send_InvalidPriority_ThrowsBeforeRouting()
+    {
+        var session = NewSession();
+        using var busA = Open(session, 0);
+
+        using var node = J1939Node.Open(busA, new J1939NodeOptions(Name(1)));
+        await node.ClaimAddressAsync(0x82).WithTimeout(ShortTimeout);
+
+        var payloads = new[]
+        {
+            new byte[] { 1, 2, 3 },
+            new byte[] { 1, 2, 3, 4, 5, 6, 7, 8, 9 },
+        };
+
+        foreach (var payload in payloads)
+        {
+            Func<Task> send = () => node.SendAsync(new J1939Message(0xFEF2u, payload, priority: 8));
+            var ex = (await send.Should().ThrowAsync<ArgumentOutOfRangeException>()).Which;
+            ex.ParamName.Should().Be("Priority");
+        }
+    }
+
     // A > 8-byte payload broadcast MUST use J1939-TP.BAM. We watch for TP.CM frames from the
     // sender on the bus and require the receiver's application PGN to arrive on
     // MessageReceived (proving the whole TP session ran through and reassembled).

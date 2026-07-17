@@ -30,16 +30,14 @@ public sealed class J1939NodeOptions
     public TimeSpan ClaimAnnounceTimeout { get; init; } = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
-    /// Default priority used when the sender does not specify one on a
-    /// <see cref="J1939Message"/>. SAE J1939-71 §5 uses priority 6 for most non-safety-critical
-    /// broadcasts; 3 for the Address Claim traffic itself. Defaults to 6.
+    /// Default priority reported for inbound reassembled J1939-TP payloads, where the transport
+    /// channel does not currently expose the original TP.CM / TP.DT CAN priority. Defaults to 6.
     /// </summary>
     public byte DefaultPriority { get; init; } = 6;
 
     /// <summary>
-    /// Priority for Address Claim / Cannot Claim (PGN 0xEE00) and Request-PGN (PGN 0xEA00)
-    /// frames. SAE J1939-81 §4.4.3.1 mandates priority 6 for the claim; SAE J1939-21 uses
-    /// priority 3 for Request. Defaults to 6.
+    /// Priority used by this node for Address Claim / Cannot Claim (PGN 0xEE00) and Request-PGN
+    /// (PGN 0xEA00) frames. Defaults to 6.
     /// </summary>
     public byte ClaimPriority { get; init; } = 6;
 

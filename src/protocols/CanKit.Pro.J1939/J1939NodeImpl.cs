@@ -44,9 +44,10 @@ internal sealed class J1939NodeImpl : IJ1939Node
     private readonly ProtocolActor _actor;
     private readonly DeadlineScheduler _deadlines;
     private readonly ISubscription _subscription;
-    // The transport channel and its reader task are recreated whenever the node's own SA
-    // changes: J1939TpChannel binds its RX destination filter to the SA at construction, so
-    // after a successful claim we must re-open the channel on the claimed SA (Bugbot
+    // The transport channel and its reader task are recreated whenever the node's claimed
+    // address changes: J1939TpChannel uses its SourceAddress as the local channel identity and
+    // accepts inbound TP frames whose destination address is that identity (or global 0xFF), so
+    // after a successful claim we must re-open the channel on the claimed address (Bugbot
     // 3600377721). Mutation of these two fields only happens on the actor loop.
     private IJ1939TpChannel _transport = null!;
     private Task _transportReaderTask = null!;
@@ -112,9 +113,10 @@ internal sealed class J1939NodeImpl : IJ1939Node
         _deadlines = new DeadlineScheduler(_actor);
 
         // The TP channel is initially bound to the null address 0xFE because the node does not
-        // yet have a claimed SA. Its RX destination filter is `destination == our SA || 0xFF`,
-        // so at 0xFE it still receives BAM (broadcast, DA=0xFF) traffic — but directed TP.CM
-        // to a *claimed* address cannot arrive until we re-open the channel with that SA
+        // yet have a claimed address. J1939TpChannel filters inbound TP frames by destination
+        // address (the PDU1 PS byte), accepting frames directed to its channel identity or the
+        // global address (0xFF), so at 0xFE it still receives BAM traffic. Directed TP.CM to a
+        // claimed address cannot arrive until we re-open the channel with that identity
         // (Bugbot 3600377721). RebindTransportOnLoop does exactly that at each ClaimState
         // transition; here we just seed the initial placeholder channel.
         try
@@ -237,8 +239,8 @@ internal sealed class J1939NodeImpl : IJ1939Node
         // as well, but clearing the address here also makes the Address getter honest during
         // the arbitration window (Bugbot 3600377725).
         WriteAddress(null);
-        // Unbind the transport from any prior claimed SA so we do not accept directed TP.CM
-        // for the old address during the new arbitration window. Placeholder 0xFE still
+        // Unbind the transport from any prior claimed address so we do not accept directed
+        // TP.CM for the old address during the new arbitration window. Placeholder 0xFE still
         // receives broadcast TP.BAM traffic.
         RebindTransportOnLoop(J1939Pgn.NullAddress);
 
@@ -277,9 +279,9 @@ internal sealed class J1939NodeImpl : IJ1939Node
 
         // Nobody contested us within the arbitration window: commit the address.
         WriteAddress(preferredAddress);
-        // Rebind the TP channel to the claimed SA so directed TP.CM/TP.DT to us gets accepted
-        // (its RX filter is `destination == SA || 0xFF broadcast`; a 0xFE placeholder drops
-        // directed traffic — Bugbot 3600377721).
+        // Rebind the TP channel to the claimed address so directed TP.CM/TP.DT to us gets
+        // accepted (the channel filters TP RX by destination address; a 0xFE placeholder drops
+        // traffic directed to the claimed address — Bugbot 3600377721).
         RebindTransportOnLoop(preferredAddress);
         SetClaimState(J1939ClaimState.Claimed, preferredAddress, contendingSa: null, contendingName: null);
         pending.Tcs.TrySetResult(null);
@@ -387,6 +389,10 @@ internal sealed class J1939NodeImpl : IJ1939Node
 
     private async Task SendCoreAsync(J1939Message message, CancellationToken cancellationToken)
     {
+        if (message.Priority > 7)
+            throw new ArgumentOutOfRangeException(nameof(message.Priority), message.Priority,
+                "J1939 priority must be in [0, 7].");
+
         // Gate strictly on ClaimState==Claimed (Bugbot 3600377725): checking only that the
         // address store is non-negative would let application traffic go out on the previous
         // SA during a re-claim, while the wire already advertises a different preferred
@@ -401,8 +407,7 @@ internal sealed class J1939NodeImpl : IJ1939Node
         // Direct single-frame path (payload <= 8 bytes) — FR-J1939-006.
         if (message.Payload.Length <= 8)
         {
-            byte priority = message.Priority > 7 ? _options.DefaultPriority : message.Priority;
-            uint canId = J1939Id.ComposePgn(priority, message.Pgn, sa,
+            uint canId = J1939Id.ComposePgn(message.Priority, message.Pgn, sa,
                 destinationAddress: message.DestinationAddress);
             var payload = new byte[message.Payload.Length];
             if (message.Payload.Length > 0) message.Payload.Span.CopyTo(payload);
@@ -417,8 +422,8 @@ internal sealed class J1939NodeImpl : IJ1939Node
 
         // Multi-frame (> 8 bytes) path via the shared J1939-TP channel — FR-J1939-006.
         // After a successful claim RebindTransportOnLoop re-opens _transport on the claimed
-        // SA, so it is safe to use directly for both TX (peer sees the correct SA on RTS/DT)
-        // and RX (CTS/EOM from the peer come back to this same channel).
+        // address, so it is safe to use directly for both TX (peer sees the correct SA on
+        // RTS/DT) and RX (CTS/EOM are addressed back to this channel identity).
         // Note (Copilot 3600424623): message.Priority is ignored on this path — TP.CM / TP.DT
         // use the channel's J1939TpOptions.Priority (default 7) because the current
         // IJ1939TpChannel API does not expose a per-send priority. J1939Message.Priority
