@@ -543,11 +543,25 @@ internal sealed class J1939NodeImpl : IJ1939Node
             await foreach (var datagram in transport.ReceiveAllAsync(_readerCts.Token).ConfigureAwait(false))
             {
                 // Reassembled PDU: emit as a J1939Message just like a single-frame arrival.
+                // `IJ1939Node.MessageReceived` documents that handlers run on the node's actor
+                // loop; the transport reader is a separate Task, so we must marshal onto the
+                // actor before firing the event so single-frame and multi-frame receive paths
+                // share the same thread affinity guarantee (Bugbot 3600440957).
                 var message = new J1939Message(datagram.Pgn, datagram.Payload,
                     priority: _options.DefaultPriority,
                     sourceAddress: datagram.SourceAddress,
                     destinationAddress: datagram.DestinationAddress);
-                EmitMessage(message);
+                try
+                {
+                    _actor.Post(() => EmitMessage(message));
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Node was disposed while we had a datagram in hand; drop it silently —
+                    // consistent with the RunReaderAsync path which also stops posting after
+                    // dispose.
+                    return;
+                }
             }
         }
         catch (OperationCanceledException) { /* expected on Dispose */ }
