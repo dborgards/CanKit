@@ -526,6 +526,81 @@ public class J1939NodeTests : IClassFixture<TestCaseProvider>
     }
 
     // ---------------------------------------------------------------------------------------
+    // Bugbot 3600614141 regression: when cts.Cancel() lands *at or after* the arbitration
+    // deadline expires, OnClaimAnnounceElapsed can hit its "TCS already completed" early-
+    // return branch (the token registration set TrySetCanceled before the cancel post
+    // reached the actor) and the subsequent CancelPendingClaimOnLoop can then find
+    // `_pendingClaim` already null. Before the fix, that pair left ClaimState stuck at
+    // Claiming with no address and TP still bound to 0xFE — an unrecoverable-except-via-
+    // BeginClaim state that both the caller (who saw TaskCanceled) and any observer
+    // (who polls ClaimState) were told nothing about.
+    //
+    // The invariant this test enforces: regardless of which side of the deadline/cancel
+    // race won on a given iteration, the settled ClaimState must NEVER remain at Claiming
+    // (only NotClaimed or Claimed are legal terminal states after a canceled claim).
+    // We use CancellationTokenSource.CancelAfter with the arbitration timeout so the two
+    // timers (System.Threading.Timer for CT and DeadlineScheduler for the announce) race
+    // on nearly the same wall-clock instant, spread over many iterations to sample both
+    // sides of the race.
+    // ---------------------------------------------------------------------------------------
+    [Fact]
+    public async Task ClaimAddressAsync_CancelAtArbitrationDeadline_NeverLeavesStateStuckInClaiming()
+    {
+        var session = NewSession();
+        using var busA = Open(session, 0);
+
+        // Tight arbitration window so CancelAfter and the announce deadline collide with
+        // minimum jitter separation. Repeated iterations vary the exact interleave
+        // through natural CI scheduling jitter across ThreadPool and the actor loop.
+        var arbitrationTimeout = TimeSpan.FromMilliseconds(30);
+        var opts = new J1939NodeOptions(Name(1))
+        {
+            ClaimAnnounceTimeout = arbitrationTimeout,
+        };
+        using var node = J1939Node.Open(busA, opts);
+
+        for (int iter = 0; iter < 40; iter++)
+        {
+            byte preferred = (byte)(0x30 + (iter % 0x50));
+            using var cts = new CancellationTokenSource();
+
+            // Fire the cancel via System.Threading.Timer at (approximately) the same
+            // instant the arbitration deadline fires on the actor loop. That maximises
+            // the chance of catching the "OnClaimAnnounceElapsed observes a canceled
+            // TCS" interleave the fix targets.
+            cts.CancelAfter(arbitrationTimeout);
+
+            var claimTask = node.ClaimAddressAsync(preferred, cts.Token);
+            try
+            {
+                await claimTask.WithTimeout(ShortTimeout);
+            }
+            catch (OperationCanceledException) { /* cancel raced ahead of the deadline */ }
+            // If claimTask completed successfully the deadline won and we ended up
+            // Claimed at `preferred`; either outcome is acceptable — the invariant we
+            // care about is that ClaimState never remains at Claiming after settle.
+
+            // Give the actor loop time to fully unwind both callbacks (Fire and cancel
+            // post). The deadline is short, but ThreadPool + actor scheduling means the
+            // teardown can trail the awaited task by a few tens of ms.
+            await Task.Delay(50);
+
+            node.ClaimState.Should().NotBe(J1939ClaimState.Claiming,
+                $"iteration {iter}: cancelling at the arbitration deadline must never leave the node stuck in Claiming");
+            if (node.ClaimState == J1939ClaimState.NotClaimed)
+                node.Address.Should().BeNull(
+                    $"iteration {iter}: NotClaimed after cancel must have a null address");
+        }
+
+        // After the stress loop, the node's state machine must still be responsive: a
+        // fresh uncancelled claim on a new SA must go through cleanly no matter which
+        // race outcome dominated the loop above.
+        await node.ClaimAddressAsync(0x50).WithTimeout(ShortTimeout);
+        node.ClaimState.Should().Be(J1939ClaimState.Claimed);
+        node.Address.Should().Be((byte)0x50);
+    }
+
+    // ---------------------------------------------------------------------------------------
     // Bugbot 3600377725 regression: starting a fresh ClaimAddressAsync on an already-claimed
     // node MUST invalidate the old SA immediately. SendAsync must reject application traffic
     // (throw J1939NoAddressException) until the new claim reaches Claimed again, otherwise the

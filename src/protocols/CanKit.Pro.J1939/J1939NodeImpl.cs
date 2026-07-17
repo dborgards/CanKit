@@ -194,7 +194,26 @@ internal sealed class J1939NodeImpl : IJ1939Node
     {
         if (_disposed != 0) return;
         var pending = _pendingClaim;
-        if (pending is null) return;
+        if (pending is null)
+        {
+            // Bugbot 3600614141: OnClaimAnnounceElapsed can race the cancel post and consume
+            // `_pendingClaim` on its early-return path (its check for TCS-already-completed
+            // fires because the token registration called TrySetCanceled *before* posting
+            // the cancel). In that case the deadline callback already cleared the pending
+            // slot but returned without touching ClaimState, so without this defensive
+            // sweep the node stays wedged in Claiming with no address. Rolling back to
+            // NotClaimed here (BeginClaim already invalidated the address and rebound the
+            // TP channel to 0xFE) is idempotent and safe if OnClaimAnnounceElapsed already
+            // committed the same transition.
+            if ((J1939ClaimState)Volatile.Read(ref _claimStateStore) == J1939ClaimState.Claiming)
+            {
+                WriteAddress(null);
+                RebindTransportOnLoop(J1939Pgn.NullAddress);
+                SetClaimState(J1939ClaimState.NotClaimed, address: null,
+                    contendingSa: null, contendingName: null);
+            }
+            return;
+        }
         // A newer ClaimAddressAsync may have replaced this pending claim already; in that case
         // the fresh claim owns the actor state and we must not disturb it.
         if (!ReferenceEquals(pending.Tcs, tcs)) return;
@@ -270,6 +289,18 @@ internal sealed class J1939NodeImpl : IJ1939Node
             _pendingClaim = null;
             pending.Deadline?.Dispose();
             pending.CtRegistration.Dispose();
+            // Bugbot 3600614141: BeginClaim moved us into Claiming and cleared the address /
+            // rebound the TP to 0xFE. Because we are abandoning this pending claim without
+            // committing, we MUST roll the state machine back to NotClaimed here — otherwise
+            // the subsequent CancelPendingClaimOnLoop (or Dispose) sees no pending claim and
+            // leaves ClaimState stuck at Claiming with no address.
+            if ((J1939ClaimState)Volatile.Read(ref _claimStateStore) == J1939ClaimState.Claiming)
+            {
+                WriteAddress(null);
+                RebindTransportOnLoop(J1939Pgn.NullAddress);
+                SetClaimState(J1939ClaimState.NotClaimed, address: null,
+                    contendingSa: null, contendingName: null);
+            }
             return;
         }
 
