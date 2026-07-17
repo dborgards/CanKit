@@ -692,6 +692,61 @@ public class J1939NodeTests : IClassFixture<TestCaseProvider>
         finalSent.Should().BeGreaterThan(5,
             "the peer must generate enough BAM traffic to exercise the rebind window");
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Bugbot 3600591980 regression: SendCoreAsync checks ClaimState/address once before
+    // awaiting the wire I/O. A concurrent ClaimAddressAsync running on the actor loop can
+    // clear or move the SA mid-flight, and before the fix the send task completed
+    // successfully — the frame went out on the previous SA while the wire simultaneously
+    // advertised a different preferred address (or the multi-frame session was interrupted
+    // by RebindTransportOnLoop with an internal ObjectDisposedException surfacing). The
+    // send MUST fail with J1939NoAddressException so the failure mode matches the pre-send
+    // gate on ClaimState==Claimed.
+    // ---------------------------------------------------------------------------------------
+    [Fact]
+    public async Task Send_InFlightAcrossReclaim_FailsWithNoAddressException()
+    {
+        var session = NewSession();
+        using var busA = Open(session, 0);
+
+        // Longer Th so a multi-frame TP.BAM stays on the wire long enough for us to start a
+        // re-claim while the send is still awaiting the last TP.DT.
+        var opts = new J1939NodeOptions(Name(1))
+        {
+            ClaimAnnounceTimeout = TimeSpan.FromMilliseconds(200),
+            TransportOptions = new J1939TpOptions().With(th: TimeSpan.FromMilliseconds(60)),
+        };
+        using var node = J1939Node.Open(busA, opts);
+        await node.ClaimAddressAsync(0x11).WithTimeout(ShortTimeout);
+        node.Address.Should().Be((byte)0x11);
+
+        // Multi-frame BAM: 60 bytes → 9 TP.DT frames at Th ≈ 60 ms each keeps the send task
+        // awaiting for several hundred ms, giving us room to trigger a re-claim.
+        var payload = new byte[60];
+        for (int i = 0; i < payload.Length; i++) payload[i] = (byte)i;
+        var sendTask = node.SendAsync(new J1939Message(0xFED2u, payload, destinationAddress: 0xFF));
+
+        // Wait for the actor to actually start the TP session before racing the re-claim
+        // in; otherwise BeginClaim could run before SendCoreAsync captured the SA.
+        for (int i = 0; i < 20 && !sendTask.IsCompleted && node.ClaimState == J1939ClaimState.Claimed; i++)
+            await Task.Delay(10);
+
+        // Kick off a reclaim to a different preferred address. BeginClaim clears the
+        // captured address, and (with the Bugbot 3600591973 fix) synchronously disposes the
+        // shared TP channel — either way SendCoreAsync must not report success.
+        var reclaimTask = node.ClaimAddressAsync(0x22);
+
+        Func<Task> awaitSend = () => sendTask.WithTimeout(ShortTimeout);
+        await awaitSend.Should().ThrowAsync<J1939NoAddressException>(
+            "an in-flight send whose captured SA was invalidated by a concurrent " +
+            "ClaimAddressAsync must surface the same J1939NoAddressException as the pre-send gate");
+
+        // The reclaim itself must still complete cleanly on the new SA — the send failure
+        // does not tear down the claim state machine.
+        await reclaimTask.WithTimeout(ShortTimeout);
+        node.ClaimState.Should().Be(J1939ClaimState.Claimed);
+        node.Address.Should().Be((byte)0x22);
+    }
 }
 
 internal static class J1939NodeTestExtensions

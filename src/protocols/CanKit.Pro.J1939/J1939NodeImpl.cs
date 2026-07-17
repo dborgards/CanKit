@@ -404,54 +404,83 @@ internal sealed class J1939NodeImpl : IJ1939Node
             throw new J1939NoAddressException();
 
         byte sa = (byte)addr;
-        // Direct single-frame path (payload <= 8 bytes) — FR-J1939-006.
-        if (message.Payload.Length <= 8)
-        {
-            uint canId = J1939Id.ComposePgn(message.Priority, message.Pgn, sa,
-                destinationAddress: message.DestinationAddress);
-            var payload = new byte[message.Payload.Length];
-            if (message.Payload.Length > 0) message.Payload.Span.CopyTo(payload);
-
-            using var frame = CanFrame.Classic(unchecked((int)canId), payload, isExtendedFrame: true);
-            var confirmation = await _service.SendConfirmed(frame, cancellationToken: cancellationToken).ConfigureAwait(false);
-            if (!confirmation.Confirmed)
-                throw new J1939NodeException(
-                    $"J1939 send failed for PGN 0x{message.Pgn:X}: {confirmation.FailureReason}.");
-            return;
-        }
-
-        // Multi-frame (> 8 bytes) path via the shared J1939-TP channel — FR-J1939-006.
-        // After a successful claim RebindTransportOnLoop re-opens _transport on the claimed
-        // address, so it is safe to use directly for both TX (peer sees the correct SA on
-        // RTS/DT) and RX (CTS/EOM are addressed back to this channel identity).
-        // Note (Copilot 3600424623): message.Priority is ignored on this path — TP.CM / TP.DT
-        // use the channel's J1939TpOptions.Priority (default 7) because the current
-        // IJ1939TpChannel API does not expose a per-send priority. J1939Message.Priority
-        // documents the same. Callers who need a specific TP priority must configure
-        // J1939NodeOptions.TransportOptions.Priority when opening the node.
-        var tpChannel = _transport;
-        if (tpChannel.SourceAddress != sa)
-        {
-            // Rebind hasn't landed yet (would be a claim/send race on the actor loop) — fall
-            // back to a single-use per-send TP channel bound to the currently-claimed SA so
-            // the wire carries the right SA regardless.
-            tpChannel = J1939Tp.J1939Tp.Open(_service, sourceAddress: sa,
-                options: _options.TransportOptions, leaveOpen: true);
-        }
         try
         {
-            var payloadArr = message.Payload.ToArray();
-            if (message.DestinationAddress == J1939Pgn.GlobalAddress)
-                await tpChannel.SendBamAsync(message.Pgn, payloadArr, cancellationToken).ConfigureAwait(false);
+            // Direct single-frame path (payload <= 8 bytes) — FR-J1939-006.
+            if (message.Payload.Length <= 8)
+            {
+                uint canId = J1939Id.ComposePgn(message.Priority, message.Pgn, sa,
+                    destinationAddress: message.DestinationAddress);
+                var payload = new byte[message.Payload.Length];
+                if (message.Payload.Length > 0) message.Payload.Span.CopyTo(payload);
+
+                using var frame = CanFrame.Classic(unchecked((int)canId), payload, isExtendedFrame: true);
+                var confirmation = await _service.SendConfirmed(frame, cancellationToken: cancellationToken).ConfigureAwait(false);
+                if (!confirmation.Confirmed)
+                    throw new J1939NodeException(
+                        $"J1939 send failed for PGN 0x{message.Pgn:X}: {confirmation.FailureReason}.");
+            }
             else
-                await tpChannel.SendCmAsync(message.Pgn, message.DestinationAddress, payloadArr, cancellationToken).ConfigureAwait(false);
+            {
+                // Multi-frame (> 8 bytes) path via the shared J1939-TP channel — FR-J1939-006.
+                // After a successful claim RebindTransportOnLoop re-opens _transport on the
+                // claimed address, so it is safe to use directly for both TX (peer sees the
+                // correct SA on RTS/DT) and RX (CTS/EOM are addressed back to this channel
+                // identity).
+                // Note (Copilot 3600424623): message.Priority is ignored on this path — TP.CM
+                // / TP.DT use the channel's J1939TpOptions.Priority (default 7) because the
+                // current IJ1939TpChannel API does not expose a per-send priority.
+                // J1939Message.Priority documents the same. Callers who need a specific TP
+                // priority must configure J1939NodeOptions.TransportOptions.Priority when
+                // opening the node.
+                var tpChannel = _transport;
+                if (tpChannel.SourceAddress != sa)
+                {
+                    // Rebind hasn't landed yet (would be a claim/send race on the actor loop)
+                    // — fall back to a single-use per-send TP channel bound to the currently-
+                    // claimed SA so the wire carries the right SA regardless.
+                    tpChannel = J1939Tp.J1939Tp.Open(_service, sourceAddress: sa,
+                        options: _options.TransportOptions, leaveOpen: true);
+                }
+                try
+                {
+                    var payloadArr = message.Payload.ToArray();
+                    if (message.DestinationAddress == J1939Pgn.GlobalAddress)
+                        await tpChannel.SendBamAsync(message.Pgn, payloadArr, cancellationToken).ConfigureAwait(false);
+                    else
+                        await tpChannel.SendCmAsync(message.Pgn, message.DestinationAddress, payloadArr, cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    if (!ReferenceEquals(tpChannel, _transport))
+                        tpChannel.Dispose();
+                }
+            }
         }
-        finally
+        catch (ObjectDisposedException) when (HasReclaimCrossed(sa))
         {
-            if (!ReferenceEquals(tpChannel, _transport))
-                tpChannel.Dispose();
+            // Bugbot 3600591980: RebindTransportOnLoop disposed the shared TP channel while
+            // our multi-frame send was awaiting SendBamAsync / SendCmAsync. That surfaces as
+            // ObjectDisposedException from the TP channel; substitute the canonical
+            // reclaim-failure so the caller sees the same failure mode as the pre-send gate
+            // rather than an internal-implementation exception.
+            throw new J1939NoAddressException();
         }
+
+        // Bugbot 3600591980: in-flight sends MUST honor a concurrent reclaim. SendCoreAsync
+        // captured the claim state / SA before awaiting the wire I/O, but ClaimAddressAsync
+        // running on the actor loop between the initial gate and this point may have cleared
+        // or moved the address (BeginClaim invalidates the address before announcing the new
+        // preferred SA). If that happened the frame(s) we just placed on the wire went out
+        // on the previous SA (single-frame path) or spanned the reclaim boundary (multi-
+        // frame path); the caller must not observe a successful send that crossed reclaim.
+        if (HasReclaimCrossed(sa))
+            throw new J1939NoAddressException();
     }
+
+    private bool HasReclaimCrossed(byte capturedSa)
+        => (J1939ClaimState)Volatile.Read(ref _claimStateStore) != J1939ClaimState.Claimed
+           || Volatile.Read(ref _addressStore) != capturedSa;
 
     /// <inheritdoc />
     public Task RequestPgnAsync(uint requestedPgn, byte destinationAddress = 0xFF,
