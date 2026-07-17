@@ -164,15 +164,51 @@ internal sealed class J1939NodeImpl : IJ1939Node
         CancellationTokenRegistration ctr = default;
         if (cancellationToken.CanBeCanceled)
         {
+            // On user cancel we must both complete the returned task and tear down the pending
+            // claim on the actor loop so `OnClaimAnnounceElapsed` cannot later commit the
+            // preferred address after the caller already saw a cancellation (Bugbot
+            // 3600440955). The actor post is best-effort — if the node has already been
+            // disposed the mailbox is closed and there is no pending state to unwind anyway.
             ctr = cancellationToken.Register(static state =>
             {
-                var t = (TaskCompletionSource<object?>)state!;
-                t.TrySetCanceled();
-            }, tcs);
+                var box = (ClaimCancelState)state!;
+                try
+                {
+                    box.Node._actor.Post(() => box.Node.CancelPendingClaimOnLoop(box.Tcs));
+                }
+                catch (ObjectDisposedException) { /* actor already gone */ }
+                box.Tcs.TrySetCanceled();
+            }, new ClaimCancelState(this, tcs));
         }
 
         _actor.Post(() => BeginClaim(preferredAddress, tcs, ctr));
         return tcs.Task;
+    }
+
+    // Runs on the actor loop. Tears down `_pendingClaim` when its owning caller cancels the
+    // ClaimAddressAsync task, so the arbitration timer cannot later commit the address after
+    // the caller has already observed a cancellation (Bugbot 3600440955).
+    private void CancelPendingClaimOnLoop(TaskCompletionSource<object?> tcs)
+    {
+        if (_disposed != 0) return;
+        var pending = _pendingClaim;
+        if (pending is null) return;
+        // A newer ClaimAddressAsync may have replaced this pending claim already; in that case
+        // the fresh claim owns the actor state and we must not disturb it.
+        if (!ReferenceEquals(pending.Tcs, tcs)) return;
+
+        _pendingClaim = null;
+        pending.Deadline?.Dispose();
+        pending.CtRegistration.Dispose();
+
+        // BeginClaim already invalidated the address (WriteAddress(null)) and rebound the TP
+        // channel back to the 0xFE placeholder before the arbitration announce, so rolling
+        // the state machine back to NotClaimed on cancel is sufficient — there is no prior
+        // Claimed state left to restore even for a re-claim on top of a previously-claimed
+        // node.
+        SetClaimState(J1939ClaimState.NotClaimed, address: null,
+            contendingSa: null, contendingName: null);
+        pending.Tcs.TrySetCanceled();
     }
 
     private void BeginClaim(byte preferredAddress, TaskCompletionSource<object?> tcs,
@@ -220,6 +256,21 @@ internal sealed class J1939NodeImpl : IJ1939Node
     {
         var pending = _pendingClaim;
         if (pending is null || pending.PreferredAddress != preferredAddress) return;
+
+        // If the caller already cancelled/faulted the returned task (racing between the
+        // deadline callback and CancelPendingClaimOnLoop), do not commit the address — the
+        // caller has already seen a non-success outcome (Bugbot 3600440955). The actor
+        // serializes both callbacks, so this only catches the rare interleave where the
+        // token registration set TrySetCanceled *before* posting the cancel, and the deadline
+        // fired before the cancel post ran.
+        if (pending.Tcs.Task.IsCompleted)
+        {
+            _pendingClaim = null;
+            pending.Deadline?.Dispose();
+            pending.CtRegistration.Dispose();
+            return;
+        }
+
         _pendingClaim = null;
         pending.Deadline?.Dispose();
         pending.CtRegistration.Dispose();
@@ -657,6 +708,20 @@ internal sealed class J1939NodeImpl : IJ1939Node
     // =========================================================================================
     // Nested types
     // =========================================================================================
+
+    // Boxed state passed to CancellationToken.Register so the callback can post the actor
+    // teardown for the specific in-flight claim it corresponds to.
+    private sealed class ClaimCancelState
+    {
+        public ClaimCancelState(J1939NodeImpl node, TaskCompletionSource<object?> tcs)
+        {
+            Node = node;
+            Tcs = tcs;
+        }
+
+        public J1939NodeImpl Node { get; }
+        public TaskCompletionSource<object?> Tcs { get; }
+    }
 
     private sealed class PendingClaim
     {

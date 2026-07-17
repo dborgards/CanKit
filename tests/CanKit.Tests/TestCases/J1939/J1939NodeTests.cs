@@ -448,6 +448,55 @@ public class J1939NodeTests : IClassFixture<TestCaseProvider>
     }
 
     // ---------------------------------------------------------------------------------------
+    // Bugbot 3600440955 regression: cancelling ClaimAddressAsync during the arbitration
+    // window MUST tear down the pending claim on the actor and prevent the arbitration timer
+    // from later committing the address. Before the fix, the cancellation registration only
+    // called TrySetCanceled on the returned task; OnClaimAnnounceElapsed still fired and
+    // moved ClaimState to Claimed, silently contradicting the observed cancellation.
+    // ---------------------------------------------------------------------------------------
+    [Fact]
+    public async Task ClaimAddressAsync_CancelDuringArbitration_TearsDownPendingClaim()
+    {
+        var session = NewSession();
+        using var busA = Open(session, 0);
+
+        // Long arbitration window so the test can cancel comfortably in the middle. 500 ms is
+        // well above the actor scheduling jitter we need to observe.
+        var opts = new J1939NodeOptions(Name(1))
+        {
+            ClaimAnnounceTimeout = TimeSpan.FromMilliseconds(500),
+        };
+        using var node = J1939Node.Open(busA, opts);
+
+        using var cts = new CancellationTokenSource();
+        var claimTask = node.ClaimAddressAsync(0x33, cts.Token);
+
+        // Give the actor a beat to enter Claiming so we know we cancel mid-arbitration and
+        // not before BeginClaim has run.
+        for (int i = 0; i < 20 && node.ClaimState != J1939ClaimState.Claiming; i++)
+            await Task.Delay(10);
+        node.ClaimState.Should().Be(J1939ClaimState.Claiming);
+
+        cts.Cancel();
+
+        // The task itself must complete as cancelled.
+        Func<Task> awaitClaim = () => claimTask.WithTimeout(ShortTimeout);
+        await awaitClaim.Should().ThrowAsync<TaskCanceledException>();
+
+        // Wait past the original arbitration window so any surviving timer would have fired.
+        await Task.Delay(700);
+
+        // The node MUST NOT have silently committed to the cancelled address.
+        node.ClaimState.Should().NotBe(J1939ClaimState.Claimed);
+        node.Address.Should().BeNull();
+
+        // A fresh claim must still work (i.e. teardown left the state machine consistent).
+        await node.ClaimAddressAsync(0x44).WithTimeout(ShortTimeout);
+        node.ClaimState.Should().Be(J1939ClaimState.Claimed);
+        node.Address.Should().Be((byte)0x44);
+    }
+
+    // ---------------------------------------------------------------------------------------
     // Bugbot 3600377725 regression: starting a fresh ClaimAddressAsync on an already-claimed
     // node MUST invalidate the old SA immediately. SendAsync must reject application traffic
     // (throw J1939NoAddressException) until the new claim reaches Claimed again, otherwise the
