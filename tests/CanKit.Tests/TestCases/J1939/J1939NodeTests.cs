@@ -340,11 +340,17 @@ public class J1939NodeTests : IClassFixture<TestCaseProvider>
         await sender.SendAsync(new J1939Message(0xFEF2u, new byte[] { 1, 2, 3, 4, 5, 6 }))
             .WithTimeout(ShortTimeout);
 
-        // Give the spectator's FrameObserved callback a beat to observe the frame.
-        await Task.Delay(50);
+        // Wait deterministically for exactly one single-frame observation instead of relying
+        // on a fixed 50 ms sleep (Copilot 3600424648): the fixed delay was flaky on slow CI
+        // runners, and the previous `> 0` assertion silently accepted duplicates.
+        var deadline = DateTime.UtcNow + ShortTimeout;
+        while (Volatile.Read(ref singleFrames) < 1 && DateTime.UtcNow < deadline)
+            await Task.Delay(10);
+
         Volatile.Read(ref tpFrames).Should().Be(0,
             "a ≤ 8-byte payload must not use J1939-TP");
-        Volatile.Read(ref singleFrames).Should().BeGreaterThan(0);
+        Volatile.Read(ref singleFrames).Should().Be(1,
+            "exactly one direct 29-bit frame must carry the PGN");
     }
 
     // A > 8-byte payload broadcast MUST use J1939-TP.BAM. We watch for TP.CM frames from the

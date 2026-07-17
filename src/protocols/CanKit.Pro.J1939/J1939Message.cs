@@ -55,7 +55,18 @@ public readonly struct J1939Message : IEquatable<J1939Message>
     /// <summary>User payload bytes (no framing overhead).</summary>
     public ReadOnlyMemory<byte> Payload { get; }
 
-    /// <summary>SAE J1939 priority (0..7, 0 = highest).</summary>
+    /// <summary>
+    /// SAE J1939 priority (0..7, 0 = highest).
+    /// </summary>
+    /// <remarks>
+    /// Only the single-frame (payload ≤ 8 bytes) send path encodes this value into the 29-bit
+    /// CAN ID directly. Multi-frame (&gt; 8 bytes) sends go through the shared J1939-TP channel
+    /// which uses its own <see cref="CanKit.Pro.J1939Tp.J1939TpOptions.Priority"/> (default 7)
+    /// for TP.CM / TP.DT frames — a per-send priority is not part of the current
+    /// <see cref="CanKit.Pro.J1939Tp.IJ1939TpChannel"/> API surface (Copilot 3600424623). To
+    /// control the wire priority of multi-frame traffic, set
+    /// <see cref="CanKit.Pro.J1939.J1939NodeOptions.TransportOptions"/> when opening the node.
+    /// </remarks>
     public byte Priority { get; }
 
     /// <summary>Source address (the sender's claimed address).</summary>

@@ -419,6 +419,11 @@ internal sealed class J1939NodeImpl : IJ1939Node
         // After a successful claim RebindTransportOnLoop re-opens _transport on the claimed
         // SA, so it is safe to use directly for both TX (peer sees the correct SA on RTS/DT)
         // and RX (CTS/EOM from the peer come back to this same channel).
+        // Note (Copilot 3600424623): message.Priority is ignored on this path — TP.CM / TP.DT
+        // use the channel's J1939TpOptions.Priority (default 7) because the current
+        // IJ1939TpChannel API does not expose a per-send priority. J1939Message.Priority
+        // documents the same. Callers who need a specific TP priority must configure
+        // J1939NodeOptions.TransportOptions.Priority when opening the node.
         var tpChannel = _transport;
         if (tpChannel.SourceAddress != sa)
         {
