@@ -310,11 +310,22 @@ internal sealed class J1939NodeImpl : IJ1939Node
         pending.CtRegistration.Dispose();
 
         // Nobody contested us within the arbitration window: commit the address.
-        WriteAddress(preferredAddress);
         // Rebind the TP channel to the claimed address so directed TP.CM/TP.DT to us gets
         // accepted (the channel filters TP RX by destination address; a 0xFE placeholder drops
-        // traffic directed to the claimed address — Bugbot 3600377721).
-        RebindTransportOnLoop(preferredAddress);
+        // traffic directed to the claimed address — Bugbot 3600377721). If open fails after
+        // disposing the placeholder channel, do NOT complete Claimed — multi-frame would be
+        // broken while Address looks valid (Bugbot 3600825931).
+        if (!RebindTransportOnLoop(preferredAddress))
+        {
+            WriteAddress(null);
+            SetClaimState(J1939ClaimState.NotClaimed, address: null,
+                contendingSa: null, contendingName: null);
+            pending.Tcs.TrySetException(new J1939NodeException(
+                $"J1939 claim succeeded on the wire but TP rebind to SA 0x{preferredAddress:X2} failed."));
+            return;
+        }
+
+        WriteAddress(preferredAddress);
         SetClaimState(J1939ClaimState.Claimed, preferredAddress, contendingSa: null, contendingName: null);
         pending.Tcs.TrySetResult(null);
     }
@@ -756,11 +767,16 @@ internal sealed class J1939NodeImpl : IJ1939Node
     /// the now-disposed old channel so subsequent TP sends fail loudly rather than
     /// silently transmit on a stale SA.
     /// </remarks>
-    private void RebindTransportOnLoop(byte sourceAddress)
+    /// <returns>
+    /// <see langword="true"/> when the node has a live TP channel bound to
+    /// <paramref name="sourceAddress"/> after this call; <see langword="false"/> when open
+    /// failed after disposing the previous channel (multi-frame path broken).
+    /// </returns>
+    private bool RebindTransportOnLoop(byte sourceAddress)
     {
-        if (Volatile.Read(ref _disposed) != 0) return;
+        if (Volatile.Read(ref _disposed) != 0) return false;
         var current = _transport;
-        if (current is not null && current.SourceAddress == sourceAddress) return;
+        if (current is not null && current.SourceAddress == sourceAddress) return true;
 
         // Tear down the previous transport BEFORE opening the new one so no window exists
         // where two subscribed channels can both surface the same broadcast TP.BAM
@@ -786,14 +802,17 @@ internal sealed class J1939NodeImpl : IJ1939Node
         {
             // The old channel is already disposed; the node's multi-frame path is broken
             // until the next successful rebind, but single-frame traffic keeps working via
-            // the direct service. Surface so the application can react.
+            // the direct service. Surface so the application can react. Callers that must
+            // not advertise Claimed without a live TP (claim commit) check the return value
+            // (Bugbot 3600825931).
             RaiseBackgroundException(ex);
-            return;
+            return false;
         }
 
         newTransport.BackgroundExceptionOccurred += OnTransportBackgroundException;
         _transport = newTransport;
         _transportReaderTask = StartTransportReader(newTransport);
+        return true;
     }
 
     private void HandleIncomingFrame(uint pgn, byte priority, byte sa, byte da, bool isPdu1, byte[] payload)
