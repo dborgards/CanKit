@@ -582,15 +582,42 @@ internal sealed class J1939NodeImpl : IJ1939Node
     /// <summary>
     /// Re-open <see cref="_transport"/> on <paramref name="sourceAddress"/>. Must run on the
     /// actor loop (single-writer discipline for <c>_transport</c> / <c>_transportReaderTask</c>).
-    /// A no-op if the current channel already carries the requested SA. On failure the old
-    /// channel is retained and the exception is surfaced via
-    /// <see cref="BackgroundExceptionOccurred"/>.
+    /// A no-op if the current channel already carries the requested SA.
     /// </summary>
+    /// <remarks>
+    /// Bugbot 3600591973: the previous channel MUST be disposed synchronously on the actor
+    /// loop before a new channel is opened. Fire-and-forgetting <c>Dispose</c> in parallel
+    /// with opening a fresh channel leaves both TP channels subscribed to the bus at the
+    /// same time; broadcast TP.BAM (DA = 0xFF) is accepted by both channels and both fire
+    /// reassembled datagrams, so <see cref="MessageReceived"/> sees each multi-frame BAM
+    /// once per surviving channel. <see cref="IJ1939TpChannel"/>.Dispose caps its internal
+    /// reader-drain wait at ~2 s (see <c>J1939TpChannel.Dispose</c>), and cancelling the
+    /// bus subscription is effectively instant, so the resulting actor stall is bounded.
+    /// If <c>J1939Tp.Open</c> then fails, the exception is surfaced via
+    /// <see cref="BackgroundExceptionOccurred"/> — <c>_transport</c> continues to point at
+    /// the now-disposed old channel so subsequent TP sends fail loudly rather than
+    /// silently transmit on a stale SA.
+    /// </remarks>
     private void RebindTransportOnLoop(byte sourceAddress)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
         var current = _transport;
         if (current is not null && current.SourceAddress == sourceAddress) return;
+
+        // Tear down the previous transport BEFORE opening the new one so no window exists
+        // where two subscribed channels can both surface the same broadcast TP.BAM
+        // (Bugbot 3600591973). Disposing the channel cancels its bus subscription
+        // immediately and completes its inbox, which lets our per-transport reader loop
+        // exit; we then briefly wait on that reader so it cannot post a stale EmitMessage
+        // for an old-SA datagram after this method returns.
+        if (current is not null)
+        {
+            current.BackgroundExceptionOccurred -= OnTransportBackgroundException;
+            try { current.Dispose(); }
+            catch (Exception ex) { RaiseBackgroundException(ex); }
+            try { _transportReaderTask.Wait(TimeSpan.FromSeconds(2)); }
+            catch { /* observed via task; transport reader swallows OCE/ODE by design */ }
+        }
 
         IJ1939TpChannel newTransport;
         try
@@ -600,8 +627,9 @@ internal sealed class J1939NodeImpl : IJ1939Node
         }
         catch (Exception ex)
         {
-            // Keep the old channel; upstream state transitions still succeed but directed TP
-            // to the new SA will remain silent. Surface so the application can react.
+            // The old channel is already disposed; the node's multi-frame path is broken
+            // until the next successful rebind, but single-frame traffic keeps working via
+            // the direct service. Surface so the application can react.
             RaiseBackgroundException(ex);
             return;
         }
@@ -609,18 +637,6 @@ internal sealed class J1939NodeImpl : IJ1939Node
         newTransport.BackgroundExceptionOccurred += OnTransportBackgroundException;
         _transport = newTransport;
         _transportReaderTask = StartTransportReader(newTransport);
-
-        // Dispose the old channel off-loop: J1939TpChannel.Dispose synchronously waits up to
-        // 2 s for its own reader to drain, which we do not want to hold the actor thread for.
-        if (current is not null)
-        {
-            current.BackgroundExceptionOccurred -= OnTransportBackgroundException;
-            _ = Task.Run(() =>
-            {
-                try { current.Dispose(); }
-                catch (Exception ex) { RaiseBackgroundException(ex); }
-            });
-        }
     }
 
     private void HandleIncomingFrame(uint pgn, byte priority, byte sa, byte da, bool isPdu1, byte[] payload)

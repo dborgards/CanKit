@@ -599,6 +599,99 @@ public class J1939NodeTests : IClassFixture<TestCaseProvider>
         await Task.Delay(50);
         postSa.Should().Be((byte)0x22);
     }
+
+    // ---------------------------------------------------------------------------------------
+    // Bugbot 3600591973 behavior lock: RebindTransportOnLoop MUST dispose the previous
+    // IJ1939TpChannel synchronously on the actor loop BEFORE opening a new channel. Before
+    // the fix, the old channel's Dispose was fire-and-forget while a fresh channel was
+    // simultaneously opened, so both channels could remain briefly subscribed to the bus
+    // and both accepted broadcast TP.BAM (DA = 0xFF). Reassembly and MessageReceived then
+    // fired once per surviving channel, delivering the same BAM twice.
+    //
+    // The pre-fix window between Open and Task.Run(Dispose) is sub-millisecond on the
+    // virtual bus, so this test cannot deterministically reproduce the race on every run;
+    // it pins the correctness invariant (received <= sent) across many claim/re-claim
+    // cycles under continuous broadcast BAM traffic. The synchronous-dispose fix makes the
+    // invariant hold by construction.
+    // ---------------------------------------------------------------------------------------
+    [Fact]
+    public async Task RebindTransport_DoesNotDeliverBamMoreThanOncePerRebind()
+    {
+        var session = NewSession();
+        using var busPeer = Open(session, 0);
+        using var busNode = Open(session, 1);
+
+        // Short arbitration window so many rebinds happen while peer traffic is in flight;
+        // small Th so a single BAM takes a couple of ms end-to-end.
+        var opts = new J1939NodeOptions(Name(1))
+        {
+            ClaimAnnounceTimeout = TimeSpan.FromMilliseconds(40),
+            TransportOptions = new J1939TpOptions().With(th: TimeSpan.FromMilliseconds(2)),
+        };
+        using var node = J1939Node.Open(busNode, opts);
+
+        int received = 0;
+        node.MessageReceived += (_, m) =>
+        {
+            if (m.Pgn == 0xFED1u) Interlocked.Increment(ref received);
+        };
+
+        using var peerTp = CanKit.Pro.J1939Tp.J1939Tp.Open(busPeer, sourceAddress: 0x77,
+            new J1939TpOptions().With(th: TimeSpan.FromMilliseconds(2)));
+        var payload = new byte[12];
+        for (int b = 0; b < payload.Length; b++) payload[b] = (byte)(0xE0 + b);
+
+        int sent = 0;
+        using var peerCts = new CancellationTokenSource();
+        var peerTask = Task.Run(async () =>
+        {
+            try
+            {
+                while (!peerCts.IsCancellationRequested)
+                {
+                    await peerTp.SendBamAsync(pgn: 0xFED1u, payload, peerCts.Token)
+                        .ConfigureAwait(false);
+                    Interlocked.Increment(ref sent);
+                }
+            }
+            catch (OperationCanceledException) { /* expected on cancel */ }
+            catch { /* channel disposed during shutdown */ }
+        });
+
+        // Cycle re-claims to a new SA every iteration. Each ClaimAddressAsync triggers two
+        // RebindTransportOnLoop calls (unbind to 0xFE, then rebind to the new SA) — that is
+        // where the old/new channel overlap window lived pre-fix.
+        for (int i = 0; i < 8; i++)
+        {
+            byte sa = (byte)(0x30 + i);
+            await node.ClaimAddressAsync(sa).WithTimeout(ShortTimeout);
+            node.ClaimState.Should().Be(J1939ClaimState.Claimed);
+            await Task.Delay(30);
+        }
+
+        peerCts.Cancel();
+        try { await peerTask.WithTimeout(ShortTimeout); } catch { /* peer cancel/dispose */ }
+
+        // Let any in-flight reassembly surface before the final count check.
+        await Task.Delay(150);
+
+        int finalSent = Volatile.Read(ref sent);
+        int finalReceived = Volatile.Read(ref received);
+
+        // The received count must never exceed sent: any excess means a rebind delivered
+        // the same broadcast BAM through two overlapping node-side transports. (Received <
+        // sent is expected — BAMs whose DT frames land during the ~ms rebind window get
+        // aborted / dropped by the disposed channel and never reassembled by the new one.
+        // The bug we are guarding against is duplicate delivery, not loss.)
+        finalReceived.Should().BeLessOrEqualTo(finalSent,
+            "no broadcast TP.BAM may be surfaced twice — before the fix, the fire-and-" +
+            "forget Dispose of the previous channel overlapped a freshly-opened channel " +
+            "and both subscriptions delivered the same reassembled datagram");
+        // Sanity: this test is only meaningful if the peer actually managed to run many
+        // BAMs across the rebind cycles.
+        finalSent.Should().BeGreaterThan(5,
+            "the peer must generate enough BAM traffic to exercise the rebind window");
+    }
 }
 
 internal static class J1939NodeTestExtensions
