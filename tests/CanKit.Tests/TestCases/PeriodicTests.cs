@@ -14,7 +14,7 @@ namespace CanKit.Tests.TestCases;
 
 public class PeriodicTests : IClassFixture<TestCaseProvider>
 {
-    [Theory]
+    [AdapterTheory]
     [MemberData(nameof(Matrix.TestMatrix.CombinedPeriodicCount), MemberType = typeof(Matrix.TestMatrix))]
     public async Task Periodic_Send_Completes_Exact_Count_And_Stops(string epA, string epB, string endpoint, bool hasFd,
         CanFrame frame, TimeSpan period, int count)
@@ -73,4 +73,3 @@ public class PeriodicTests : IClassFixture<TestCaseProvider>
         act.Should().Throw<ArgumentOutOfRangeException>();
     }
 }
-

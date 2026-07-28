@@ -13,7 +13,7 @@ namespace CanKit.Tests.TestCases;
 
 public class CanBusBackgroundExceptionOccurredTests : IClassFixture<TestCaseProvider>
 {
-    [Theory]
+    [AdapterTheory]
     [MemberData(nameof(Matrix.TestMatrix.Pairs), MemberType = typeof(Matrix.TestMatrix))]
     public Task BackgroundExceptionOccurred_Is_Raised_When_ReceiveThread_Hits_Exception(string epA, string epB, string __, bool hasFd)
     {

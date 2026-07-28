@@ -17,7 +17,7 @@ public class ThroughputAndFeaturesTests : IClassFixture<TestCaseProvider>
 {
     // 64 and 128 one-shot batch (Classic)
     // 单次64和128的发送批次（CAN2.0）
-    [Theory]
+    [AdapterTheory]
     [MemberData(nameof(Matrix.TestMatrix.CombinedOneShotClassic), MemberType = typeof(Matrix.TestMatrix))]
     public async Task OneShot_Batch_Classic_64_And_128(string epA, string epB, string endpoint, bool hasFd,
         int len, bool rtr, bool ide)
@@ -44,7 +44,7 @@ public class ThroughputAndFeaturesTests : IClassFixture<TestCaseProvider>
     }
     // 64 and 128 one-shot batch (FD)
     // 单次64和128的发送批次（CANFD）
-    [Theory]
+    [AdapterTheory]
     [MemberData(nameof(Matrix.TestMatrix.CombinedOneShotFD), MemberType = typeof(Matrix.TestMatrix))]
     public async Task OneShot_Batch_FD_64_And_128(string epA, string epB, string _, bool hasFd,
         int len, bool brs, bool ide)
@@ -72,7 +72,7 @@ public class ThroughputAndFeaturesTests : IClassFixture<TestCaseProvider>
 
     // >5000 continuous (CAN FD frame), gap variants with loss thresholds
     // 连续发送 > 5000帧 CANFD包，使用间隔时间
-    [Theory]
+    [AdapterTheory]
     [MemberData(nameof(Matrix.TestMatrix.CombinedContinuosFD), MemberType = typeof(Matrix.TestMatrix))]
     public async Task Continuous_Fd_Over5000_With_Gap_And_Loss
         (string epA, string epB, string _, bool hasFd, double gapMs, double lossLimit, int len, bool brs, bool ide)
@@ -117,7 +117,7 @@ public class ThroughputAndFeaturesTests : IClassFixture<TestCaseProvider>
 
     // >5000 continuous (CAN classic frame), gap variants with loss thresholds
     // 连续发送 > 5000帧 CAN包，使用间隔时间
-    [Theory]
+    [AdapterTheory]
     [MemberData(nameof(Matrix.TestMatrix.CombinedContinuosClassic), MemberType = typeof(Matrix.TestMatrix))]
     public async Task Continuous_Classic_Over5000_With_Gap_And_Loss
         (string epA, string epB, string _, bool hasFd, double gapMs, double lossLimit, int len, bool rtr, bool ide)
@@ -157,7 +157,7 @@ public class ThroughputAndFeaturesTests : IClassFixture<TestCaseProvider>
         v.BadData.Should().Be(0);
     }
     // Frame forms: classic std/ext 0 and 8 bytes; classic remote 0 and 8; FD ext 48 and 64
-    [Theory]
+    [AdapterTheory]
     [MemberData(nameof(Matrix.TestMatrix.Pairs), MemberType = typeof(Matrix.TestMatrix))]
     public async Task Frame_Types_And_Lengths_Are_Transferred(string epA, string epB, string _, bool hasFd)
     {
