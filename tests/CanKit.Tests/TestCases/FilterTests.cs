@@ -18,7 +18,7 @@ namespace CanKit.Tests.TestCases;
 public class FilterTests : IClassFixture<TestCaseProvider>
 {
     // Filter: range
-    [Theory]
+    [AdapterTheory]
     [MemberData(nameof(TestMatrix.CombinedRangeFilter), MemberType = typeof(TestMatrix))]
     public async Task Filter_Range_Work(string epA, string epB, string endpoint, bool hasFd,
         ITestDataProvider.FilterRange[] range, ITestDataProvider.FilterFrame[] frame, int expected)
@@ -53,7 +53,7 @@ public class FilterTests : IClassFixture<TestCaseProvider>
     }
 
     // Filter: mask
-    [Theory]
+    [AdapterTheory]
     [MemberData(nameof(TestMatrix.CombinedMaskFilter), MemberType = typeof(TestMatrix))]
     public async Task Filter_Mask_Work(string epA, string epB, string endpoint, bool hasFd,
         ITestDataProvider.FilterMask[] masks, ITestDataProvider.FilterFrame[] frame, int expected)
