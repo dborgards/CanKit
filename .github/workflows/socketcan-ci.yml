@@ -68,8 +68,9 @@ jobs:
       - name: Set up virtual CAN interfaces
         run: |
           set -e
+          sudo apt-get update
+          sudo apt-get install --yes libsocketcan-dev
           if ! sudo modprobe vcan; then
-            sudo apt-get update
             sudo apt-get install --yes "linux-modules-extra-$(uname -r)"
             sudo modprobe vcan
           fi
