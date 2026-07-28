@@ -42,6 +42,7 @@ public sealed class ZlgPeriodicTx : IPeriodicTx
         // long after TransmitPeriodic returned, so keep an owned copy instead of sharing
         // the caller's memory owner (which the caller may dispose right after the call).
         _frame = frame.Duplicate(bus.Options.BufferAllocator);
+        var indexAcquired = false;
         try
         {
             Period = options.Period <= TimeSpan.Zero ? TimeSpan.FromMilliseconds(1) : options.Period;
@@ -50,6 +51,7 @@ public sealed class ZlgPeriodicTx : IPeriodicTx
 
             // Unique index (best effort, ushort range)
             _index = (ushort)bus.GetAutoSendIndex();
+            indexAcquired = true;
 
             // Fire once immediately if requested
             if (options.FireImmediately)
@@ -66,9 +68,14 @@ public sealed class ZlgPeriodicTx : IPeriodicTx
         }
         catch
         {
-            // A constructor that throws is never Disposed by the caller: release the copy.
+            // A constructor that throws is never Disposed by the caller: release the copy
+            // and return any auto-send slot already taken (Dispose never runs on throw).
             try { _frame.Dispose(); } catch { /* allocator-tolerant */ }
             _frame = default;
+            if (indexAcquired)
+            {
+                try { _bus.FreeAutoSendIndex(_index); } catch { /* ignored */ }
+            }
             throw;
         }
     }
