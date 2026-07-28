@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -1019,9 +1020,9 @@ public class J1939NodeTests : IClassFixture<TestCaseProvider>
     // FR-J1939-007 (fixed-rate): emissions are anchored on the DeadlineScheduler grid
     // (t0 + n × period), so the long-run rate does not drift by the per-emission send time
     // the way a send-then-delay loop would. A 60-byte multi-frame (TP.BAM) PGN makes the
-    // per-send cost measurable (~9 Th-paced DTs); the span between the first and the sixth
-    // emission must stay on the 5 × 200 ms grid (plus jitter), where the old loop would have
-    // accumulated 5 × ~55 ms of drift.
+    // per-send cost measurable (~9 Th-paced DTs); the span between the first and the eighth
+    // emission must stay near the 7 × 200 ms grid despite scheduler jitter, where the old
+    // loop would have accumulated 7 × ~90 ms of send-time drift.
     // ---------------------------------------------------------------------------------------
     [Fact]
     public async Task StartPeriodicSend_MultiFrame_KeepsFixedRate_Without_SendTime_Drift()
@@ -1032,13 +1033,14 @@ public class J1939NodeTests : IClassFixture<TestCaseProvider>
 
         var nodeOptions = new J1939NodeOptions(Name(1))
         {
-            TransportOptions = new J1939TpOptions().With(th: TimeSpan.FromMilliseconds(5)),
+            TransportOptions = new J1939TpOptions().With(th: TimeSpan.FromMilliseconds(10)),
         };
         using var sender = J1939Node.Open(busA, nodeOptions);
         await sender.ClaimAddressAsync(0xC1).WithTimeout(ShortTimeout);
 
         const uint targetPgn = 0xFEE6u;
-        var stamps = new List<DateTime>();
+        const int requiredEmissions = 8;
+        var stamps = new List<long>();
         var stampsLock = new object();
         busB.FrameObserved += (_, e) =>
         {
@@ -1050,7 +1052,7 @@ public class J1939NodeTests : IClassFixture<TestCaseProvider>
             var data = e.CanFrame.Data.Span;
             if (data.Length < 8 || data[0] != J1939TpFrames.ControlBam) return;
             if (J1939TpFrames.ReadDataPgn(data) != targetPgn) return;
-            lock (stampsLock) stamps.Add(DateTime.UtcNow);
+            lock (stampsLock) stamps.Add(Stopwatch.GetTimestamp());
         };
 
         var period = TimeSpan.FromMilliseconds(200);
@@ -1059,29 +1061,31 @@ public class J1939NodeTests : IClassFixture<TestCaseProvider>
 
         using (var handle = sender.StartPeriodicSend(message, period))
         {
-            var deadline = DateTime.UtcNow + ShortTimeout;
+            var deadline = Stopwatch.GetTimestamp() + (long)(ShortTimeout.TotalSeconds * Stopwatch.Frequency);
             while (true)
             {
                 int count;
                 lock (stampsLock) count = stamps.Count;
-                if (count >= 6) break;
-                if (DateTime.UtcNow >= deadline)
+                if (count >= requiredEmissions) break;
+                if (Stopwatch.GetTimestamp() >= deadline)
                     throw new TimeoutException(
-                        $"Expected at least 6 periodic BAM emissions within {ShortTimeout.TotalSeconds}s; observed {count}.");
+                        $"Expected at least {requiredEmissions} periodic BAM emissions within " +
+                        $"{ShortTimeout.TotalSeconds}s; observed {count}.");
                 await Task.Delay(20);
             }
         }
 
-        List<DateTime> snapshot;
-        lock (stampsLock) snapshot = new List<DateTime>(stamps);
-        snapshot.Count.Should().BeGreaterOrEqualTo(6);
+        List<long> snapshot;
+        lock (stampsLock) snapshot = new List<long>(stamps);
+        snapshot.Count.Should().BeGreaterOrEqualTo(requiredEmissions);
 
-        var span = snapshot[snapshot.Count - 1] - snapshot[0];
+        var spanMilliseconds =
+            (snapshot[snapshot.Count - 1] - snapshot[0]) * 1000d / Stopwatch.Frequency;
         var gridSlots = (snapshot.Count - 1) * period.TotalMilliseconds;
-        span.TotalMilliseconds.Should().BeLessOrEqualTo(gridSlots * 1.1,
+        spanMilliseconds.Should().BeLessOrEqualTo(gridSlots * 1.3,
             $"fixed-rate anchoring must keep emissions on the grid ({gridSlots:F0} ms); " +
-            $"a send-then-delay loop would drift by the ~55 ms per-BAM send time each period");
-        span.TotalMilliseconds.Should().BeGreaterOrEqualTo(gridSlots * 0.5,
+            $"a send-then-delay loop would drift by the ~90 ms per-BAM send time each period");
+        spanMilliseconds.Should().BeGreaterOrEqualTo(gridSlots * 0.5,
             "sanity bound: emissions must not burst (anchor coalescing)");
     }
 
