@@ -1,3 +1,5 @@
+// Fake adapter builds intentionally bypass platform guards so native stubs can run cross-platform.
+#if !FAKE
 using System;
 using System.Runtime.InteropServices;
 using CanKit.Core;
@@ -44,3 +46,4 @@ public class AdapterPlatformGuardTests : IClassFixture<TestCaseProvider>
         act.Should().Throw<PlatformNotSupportedException>();
     }
 }
+#endif

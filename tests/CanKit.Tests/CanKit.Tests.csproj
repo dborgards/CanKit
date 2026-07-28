@@ -10,6 +10,10 @@
     <Platforms>AnyCPU;X86;X64</Platforms>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(Configuration)' == 'Fake'">
+    <DefineConstants>$(DefineConstants);FAKE</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
     <PackageReference Include="xunit" Version="2.9.0" />
@@ -42,4 +46,3 @@
     <ProjectReference Include="..\..\src\protocols\CanKit.Pro.CANopen\CanKit.Pro.CANopen.csproj" />
   </ItemGroup>
 </Project>
-
