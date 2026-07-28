@@ -21,11 +21,21 @@ internal static class VirtualBusControl
     /// simulating a controller-state transition that every bus on the session observes.</summary>
     public static void DriveBusState(string session, BusState state)
     {
-        var field = typeof(VirtualBusHub).GetField("_hubs", BindingFlags.NonPublic | BindingFlags.Static)
+        var hubsField = typeof(VirtualBusHub).GetField("_hubs", BindingFlags.NonPublic | BindingFlags.Static)
             ?? throw new InvalidOperationException("VirtualBusHub._hubs field not found.");
-        var hubs = (IDictionary)field.GetValue(null)!;
-        var hub = hubs[session] as VirtualBusHub
-            ?? throw new InvalidOperationException($"No VirtualBusHub for session '{session}'.");
+        var gateField = typeof(VirtualBusHub).GetField("_hubsGate", BindingFlags.NonPublic | BindingFlags.Static)
+            ?? throw new InvalidOperationException("VirtualBusHub._hubsGate field not found.");
+        var hubs = (IDictionary)hubsField.GetValue(null)!;
+        var gate = gateField.GetValue(null)
+            ?? throw new InvalidOperationException("VirtualBusHub._hubsGate is null.");
+
+        VirtualBusHub hub;
+        lock (gate)
+        {
+            hub = hubs[session] as VirtualBusHub
+                ?? throw new InvalidOperationException($"No VirtualBusHub for session '{session}'.");
+        }
+
         hub.SetBusState(state);
     }
 

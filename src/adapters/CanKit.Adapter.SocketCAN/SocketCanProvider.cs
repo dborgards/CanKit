@@ -46,7 +46,8 @@ public sealed class SocketCanProvider : ICanModelProvider, ICanCapabilityProvide
         if (LibSocketCan.can_get_ctrlmode(busOptions.ChannelName, out var ctrlMode) != Libc.OK)
         {
             var re = Libc.Errno();
-            if (Libc.if_nametoindex(busOptions.ChannelName) != 0)
+            if ((re == 0 || re == Libc.EOPNOTSUPP) &&
+                Libc.if_nametoindex(busOptions.ChannelName) != 0)
             {
                 CanKitLogger.LogInformation(
                     $"SocketCanBus: {busOptions.ChannelName} does not expose ctrlmode. Using static capabilities.");
