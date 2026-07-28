@@ -19,6 +19,29 @@ public sealed class CanOpenNodeOptions
     /// production tooling and is aggressive enough for tests on a virtual bus.</summary>
     public TimeSpan SdoTimeout { get; init; } = TimeSpan.FromSeconds(1);
 
+    /// <summary>
+    /// Server-side SDO session timeout: how long an open segmented server transfer (download or
+    /// upload) may idle without the peer sending the next segment / segment-ack before the
+    /// session is torn down and an SDO abort (<see cref="Sdo.SdoAbortCode.SdoProtocolTimedOut"/>)
+    /// is emitted. Prevents a client that starts a segmented transfer and then goes silent from
+    /// pinning the server's single session slot forever (the block-transfer server side already
+    /// had this guard; CiA 301 leaves the concrete value to the implementation). Deliberately
+    /// longer than <see cref="SdoTimeout"/> so a well-behaved client always times out first.
+    /// Defaults to 5 s.
+    /// </summary>
+    public TimeSpan SdoServerTimeout { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// When <c>true</c> (default), a local application write to an OD entry that is mapped in an
+    /// event-driven TPDO (<see cref="Pdo.TpdoTransmission.EventDriven"/>) automatically emits
+    /// that TPDO — change-of-state triggering per FR-CO-006 / CiA 301 §7.3.6, without the
+    /// application having to call <c>TriggerTpdoAsync</c> manually. Only application-originated
+    /// writes count: bus-originated writes (SDO server download commit, RPDO unpack) run on the
+    /// node's actor thread and never re-trigger TPDOs, so no bus echo loops can form. Set to
+    /// <c>false</c> to restore the pure manual-trigger behavior.
+    /// </summary>
+    public bool EnableChangeOfStateTpdo { get; init; } = true;
+
     /// <summary>Interval used by the built-in TPDO event-timer scheduler for TPDOs configured
     /// with <c>TpdoTransmission.EventTimer</c>. May be overridden per-PDO at configuration time.</summary>
     public TimeSpan DefaultTpdoEventTimerInterval { get; init; } = TimeSpan.FromMilliseconds(100);
@@ -79,6 +102,16 @@ public sealed class CanOpenNodeOptions
     public bool SdoBlockCrcSupported { get; init; } = true;
 
     /// <summary>
+    /// Maximum number of sub-block retransmissions per block transfer before the node aborts
+    /// (CiA 301 §7.2.4.3.15): on a partial sub-block ACK (ackseq &lt; segments sent) the sender
+    /// rewinds to the first unconfirmed segment and resends, up to this many times per transfer
+    /// — a bound against peers that never confirm progress. Applies to the download client and
+    /// the upload server alike. <c>0</c> restores the previous MVP behavior (abort on the first
+    /// partial ACK). Defaults to 3.
+    /// </summary>
+    public int SdoBlockMaxRetransmissions { get; init; } = 3;
+
+    /// <summary>
     /// When <c>true</c> this node answers a Node-Guarding RTR (COB-ID <c>0x700 + own node-id</c>)
     /// with a one-byte data frame carrying the current NMT state (bits 0..6) and an alternating
     /// toggle bit (bit 7), per CiA 301 §7.2.8.3.3. Ignored when the heartbeat producer is active
@@ -90,24 +123,30 @@ public sealed class CanOpenNodeOptions
     /// <summary>Returns a copy of this options record with the provided overrides.</summary>
     public CanOpenNodeOptions With(
         TimeSpan? sdoTimeout = null,
+        TimeSpan? sdoServerTimeout = null,
         TimeSpan? defaultTpdoEventTimerInterval = null,
         int? eventQueueCapacity = null,
         int? maxSdoTransferBytes = null,
         int? sdoBlockThresholdBytes = null,
         byte? sdoBlockSize = null,
         bool? sdoBlockCrcSupported = null,
-        bool? respondToNodeGuardingRtr = null)
+        int? sdoBlockMaxRetransmissions = null,
+        bool? respondToNodeGuardingRtr = null,
+        bool? enableChangeOfStateTpdo = null)
     {
         return new CanOpenNodeOptions
         {
             SdoTimeout = sdoTimeout ?? SdoTimeout,
+            SdoServerTimeout = sdoServerTimeout ?? SdoServerTimeout,
             DefaultTpdoEventTimerInterval = defaultTpdoEventTimerInterval ?? DefaultTpdoEventTimerInterval,
             EventQueueCapacity = eventQueueCapacity ?? EventQueueCapacity,
             MaxSdoTransferBytes = maxSdoTransferBytes ?? MaxSdoTransferBytes,
             SdoBlockThresholdBytes = sdoBlockThresholdBytes ?? SdoBlockThresholdBytes,
             SdoBlockSize = sdoBlockSize ?? SdoBlockSize,
             SdoBlockCrcSupported = sdoBlockCrcSupported ?? SdoBlockCrcSupported,
+            SdoBlockMaxRetransmissions = sdoBlockMaxRetransmissions ?? SdoBlockMaxRetransmissions,
             RespondToNodeGuardingRtr = respondToNodeGuardingRtr ?? RespondToNodeGuardingRtr,
+            EnableChangeOfStateTpdo = enableChangeOfStateTpdo ?? EnableChangeOfStateTpdo,
         };
     }
 
@@ -116,6 +155,9 @@ public sealed class CanOpenNodeOptions
         if (SdoTimeout <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(SdoTimeout), SdoTimeout,
                 "SDO timeout must be positive.");
+        if (SdoServerTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(SdoServerTimeout), SdoServerTimeout,
+                "SDO server session timeout must be positive.");
         if (DefaultTpdoEventTimerInterval <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(DefaultTpdoEventTimerInterval),
                 DefaultTpdoEventTimerInterval,
@@ -132,5 +174,8 @@ public sealed class CanOpenNodeOptions
         if (SdoBlockSize is < 1 or > 127)
             throw new ArgumentOutOfRangeException(nameof(SdoBlockSize), SdoBlockSize,
                 "SdoBlockSize must be in [1, 127] per CiA 301 §7.2.4.3.15.");
+        if (SdoBlockMaxRetransmissions < 0)
+            throw new ArgumentOutOfRangeException(nameof(SdoBlockMaxRetransmissions), SdoBlockMaxRetransmissions,
+                "SdoBlockMaxRetransmissions must be >= 0.");
     }
 }

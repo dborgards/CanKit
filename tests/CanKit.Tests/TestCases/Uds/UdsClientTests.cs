@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -45,17 +46,17 @@ public class UdsClientTests : IClassFixture<TestCaseProvider>
     /// The returned <see cref="IDisposable"/> tears down the whole stack in the right order.
     /// </summary>
     private static (IUdsClient client, SimulatedUdsEcu ecu, IDisposable dispose) BuildPair(
-        Action<SimulatedUdsEcu> configure, UdsClientOptions? options = null)
+        Action<SimulatedUdsEcu> configure, UdsClientOptions? options = null, bool useCanFd = false)
     {
         var session = NewSession();
-        var busClient = OpenClassic(session, 0);
-        var busEcu = OpenClassic(session, 1);
+        var busClient = useCanFd ? OpenCanFd(session, 0) : OpenClassic(session, 0);
+        var busEcu = useCanFd ? OpenCanFd(session, 1) : OpenClassic(session, 1);
 
         var clientEndpoint = IsoTpEndpoint.Normal(txCanId: 0x7E0, rxCanId: 0x7E8);
         var ecuEndpoint = IsoTpEndpoint.Normal(txCanId: 0x7E8, rxCanId: 0x7E0);
 
-        var clientChannel = IsoTpFactory.Open(busClient, clientEndpoint, FastIsoTp());
-        var ecuChannel = IsoTpFactory.Open(busEcu, ecuEndpoint, FastIsoTp());
+        var clientChannel = IsoTpFactory.Open(busClient, clientEndpoint, FastIsoTp(useCanFd));
+        var ecuChannel = IsoTpFactory.Open(busEcu, ecuEndpoint, FastIsoTp(useCanFd));
 
         var ecu = new SimulatedUdsEcu(ecuChannel);
         configure(ecu);
@@ -66,6 +67,64 @@ public class UdsClientTests : IClassFixture<TestCaseProvider>
 
         var dispose = new CompositeDisposable(client, ecu, ecuChannel, clientChannel, busEcu, busClient);
         return (client, ecu, dispose);
+    }
+
+    private static ICanBus OpenCanFd(string session, int channel) => CanBus.Open(
+        $"virtual://{session}/{channel}",
+        cfg => cfg.SetProtocolMode(CanProtocolMode.CanFd).Fd(TestCaseProvider.AbitRate, TestCaseProvider.DbitRate));
+
+    private static IsoTpChannelOptions FastIsoTp(bool useCanFd) => new()
+    {
+        UseCanFd = useCanFd,
+        UsePadding = true,
+        NAs = TimeSpan.FromMilliseconds(500),
+        NBs = TimeSpan.FromMilliseconds(500),
+        NCr = TimeSpan.FromMilliseconds(500),
+    };
+
+    // -----------------------------------------------------------------------------------
+    // CAN-FD matrix (FR-UDS over ISO-TP on CAN FD): the core diagnostic flows must behave
+    // identically when the transport runs on CAN-FD frames instead of classic CAN.
+    // -----------------------------------------------------------------------------------
+    [Fact]
+    public async Task CanFd_DiagnosticSessionControl_And_ReadDid_Work_Like_On_Classic()
+    {
+        var (client, ecu, dispose) = BuildPair(e =>
+        {
+            e.On(0x10, req => new byte[] { req[1], 0x00, 0x32, 0x01, 0xF4 });
+            e.On(0x22, req => new byte[] { req[1], req[2], 0x57, 0x42, 0x41 });
+        }, useCanFd: true);
+        using (dispose)
+        {
+            var sessionResponse = await client.DiagnosticSessionControlAsync(UdsSessionType.Extended,
+                new CancellationTokenSource(ShortTimeout).Token);
+            client.CurrentSession.Should().Be((byte)UdsSessionType.Extended);
+
+            var data = await client.ReadDataByIdentifierAsync(0xF190,
+                new CancellationTokenSource(ShortTimeout).Token);
+            data.Should().Equal(0x57, 0x42, 0x41);
+        }
+    }
+
+    [Fact]
+    public async Task CanFd_WriteDid_And_MultiFrame_Transfer_Work_Like_On_Classic()
+    {
+        var written = new List<byte>();
+        var (client, ecu, dispose) = BuildPair(e => e.On(0x2E, req =>
+        {
+            written.Clear();
+            written.AddRange(req);
+            return new byte[] { req[1], req[2] };
+        }), useCanFd: true);
+        using (dispose)
+        {
+            // 300-byte DID forces a multi-frame ISO-TP transfer on both directions.
+            var payload = Enumerable.Range(0, 300).Select(i => (byte)(i & 0xFF)).ToArray();
+            await client.WriteDataByIdentifierAsync(0xF190, payload,
+                new CancellationTokenSource(ShortTimeout).Token);
+
+            written.Should().HaveCount(303, "0x2E + DID (2) + 300 payload bytes must arrive intact over CAN FD");
+        }
     }
 
     // -----------------------------------------------------------------------------------
@@ -420,6 +479,41 @@ public class UdsClientTests : IClassFixture<TestCaseProvider>
             var ex = (await act.Should().ThrowAsync<UdsTimeoutException>()).Which;
             ex.Timer.Should().Be(UdsTimeoutTimer.P2);
             ex.RequestedService.Should().Be(UdsServiceId.ReadDataByIdentifier);
+        }
+    }
+
+    // -----------------------------------------------------------------------------------
+    // FR-UDS-008 — P2* timeout: ECU sends only NRC 0x78 (response pending), never a final
+    // response -> the restarted P2* timer must expire and fault with
+    // UdsTimeoutException(Timer = P2Star). This path had no test at all before (the only
+    // Timer assertion in the suite was P2); the elapsed-time assertion proves the timeout
+    // fired on the restarted P2* budget, not on the initial P2 budget.
+    // -----------------------------------------------------------------------------------
+    [Fact]
+    public async Task Client_Times_Out_With_P2Star_When_Ecu_Sends_Only_ResponsePending()
+    {
+        var (client, _, dispose) = BuildPair(
+            e => e.On(0x22, _ => throw new EcuResponsePendingThenSilent(
+                pendingCount: 2, delayBetween: TimeSpan.FromMilliseconds(40))),
+            options: new UdsClientOptions
+            {
+                P2ClientMax = TimeSpan.FromMilliseconds(100),
+                P2StarClientMax = TimeSpan.FromMilliseconds(250),
+                MaxResponsePendingCount = 10,
+            });
+        using (dispose)
+        {
+            var sw = Stopwatch.StartNew();
+            Func<Task> act = () => client.ReadDataByIdentifierAsync(0xF190,
+                new CancellationTokenSource(ShortTimeout).Token);
+            var ex = (await act.Should().ThrowAsync<UdsTimeoutException>()).Which;
+            sw.Stop();
+
+            ex.Timer.Should().Be(UdsTimeoutTimer.P2Star,
+                "the ECU answered with NRC 0x78 (response pending), so the running timer is P2* — not P2");
+            ex.RequestedService.Should().Be(UdsServiceId.ReadDataByIdentifier);
+            sw.Elapsed.Should().BeGreaterThanOrEqualTo(TimeSpan.FromMilliseconds(200),
+                "P2* restarts on each 0x78, so the timeout must fire well past the initial P2 budget (100 ms)");
         }
     }
 

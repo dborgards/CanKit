@@ -47,3 +47,56 @@ jobs:
           name: test-results-ubuntu
           path: '**/TestResults.trx'
 
+  # Real-kernel SocketCAN coverage (no fake native layer): creates a connected vxcan
+  # pair for the adapter matrix plus a standalone vcan interface for BCM tests.
+  vcan:
+    name: SocketCAN (Ubuntu, real vcan)
+    runs-on: ubuntu-latest
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Set up virtual CAN interfaces
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install --yes libsocketcan-dev
+          if ! sudo modprobe vcan || ! sudo modprobe vxcan; then
+            sudo apt-get install --yes "linux-modules-extra-$(uname -r)"
+            sudo modprobe vcan
+            sudo modprobe vxcan
+          fi
+          sudo ip link add dev vcan0 type vxcan peer name vcan1
+          sudo ip link add dev vcan2 type vcan
+          sudo ip link set up vcan0
+          sudo ip link set up vcan1
+          sudo ip link set up vcan2
+          ip -details link show vcan0
+          ip -details link show vcan1
+          ip -details link show vcan2
+
+      - name: Configure endpoints
+        run: |
+          set -e
+          echo "CANKIT_TEST_ADAPTERS=CanKit.Adapter.SocketCAN" >> "$GITHUB_ENV"
+
+      - name: Restore
+        run: dotnet restore CanKitAdapters.slnf
+
+      - name: Test (net8.0, real SocketCAN)
+        run: dotnet test CanKitAdapters.slnf -c Release -f net8.0 --logger "trx;LogFileName=TestResults-vcan.trx"
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-ubuntu-vcan
+          path: '**/TestResults-vcan.trx'

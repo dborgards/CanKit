@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Library</OutputType>
 	<Platforms>AnyCPU</Platforms>
@@ -10,7 +10,7 @@
     <AssemblyVersion>1.0.0.0</AssemblyVersion>
     <FileVersion>$(CanKitSharedFileVersion)</FileVersion>
     <Authors>Pkuyo</Authors>
-    <RepositoryUrl>https://github.com/pkuyo/CanKit</RepositoryUrl>
+    <RepositoryUrl>https://github.com/dborgards/CanKit.Pro</RepositoryUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
 
   </PropertyGroup>
@@ -40,5 +40,10 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="" />
+  </ItemGroup>
+  <!-- Lets the xUnit suite construct isolated CanRegistry instances and drive the internal
+       Register* surface for the NFR-008 concurrency stress tests (RawCanConcurrencyTests). -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="CanKit.Tests" />
   </ItemGroup>
 </Project>

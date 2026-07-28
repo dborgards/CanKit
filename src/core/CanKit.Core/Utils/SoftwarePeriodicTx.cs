@@ -9,6 +9,7 @@ using CanKit.Abstractions.API.Can.Definitions;
 using CanKit.Abstractions.API.Common;
 using CanKit.Core.Definitions;
 using CanKit.Core.Diagnostics;
+using CanKit.Core.Exceptions;
 
 namespace CanKit.Core.Utils
 {
@@ -41,7 +42,11 @@ namespace CanKit.Core.Utils
                     "SoftwarePeriodicTx: period < 2 ms may be unstable on general-purpose OS schedulers.");
             }
             _bus = bus;
-            _frame = frame;
+            // TX-lease (FR-RAW-005 / arc42 §8.1): the loop keeps re-emitting the frame long
+            // after TransmitPeriodic returned, so it must not reference the caller's memory
+            // owner (the caller may dispose an owning frame right after Start/Update). Rent
+            // an independent copy via the bus allocator and release it on Update/Stop.
+            _frame = frame.Duplicate(bus.Options.BufferAllocator);
             _period = options.Period <= TimeSpan.Zero ? TimeSpan.FromMilliseconds(1) : options.Period;
             _remaining = options.Repeat;
             _repeat = options.Repeat;
@@ -101,6 +106,13 @@ namespace CanKit.Core.Utils
             finally
             {
                 _running = false;
+                lock (_gate)
+                {
+                    // Release the owned TX-lease copy. Idempotent: default(CanFrame) has a
+                    // null owner, so Dispose() after a previous release is a no-op.
+                    try { _frame.Dispose(); } catch { /* built-in allocators tolerate redundant disposal */ }
+                    _frame = default;
+                }
                 _sDispose(ref _ctx);
             }
         }
@@ -109,7 +121,18 @@ namespace CanKit.Core.Utils
         {
             lock (_gate)
             {
-                if (frame is not null) _frame = frame.Value;
+                if (_cts.IsCancellationRequested)
+                    throw new CanBusDisposedException();
+                if (frame is not null)
+                {
+                    // TX-lease (FR-RAW-005 / arc42 §8.1): swap in an owned copy of the new
+                    // frame, then release the previously owned copy — the caller keeps
+                    // ownership of the frame they passed in.
+                    var newOwned = frame.Value.Duplicate(_bus.Options.BufferAllocator);
+                    var previous = _frame;
+                    _frame = newOwned;
+                    try { previous.Dispose(); } catch { /* built-in allocators tolerate redundant disposal */ }
+                }
                 if (period.HasValue && period.Value > TimeSpan.Zero)
                 {
                     if (period.Value < TimeSpan.FromMilliseconds(2))
@@ -346,6 +369,7 @@ namespace CanKit.Core.Utils
             public TimerPolicy policy;          // 当前策略
             public TimeSpan lastPeriodApplied;  // 已应用的周期
             public bool winResAcquired;         // Windows: 是否已 Acquire(1)
+            public bool posixSleepWarned;       // Linux: clock_nanosleep-Fallback bereits geloggt
         }
 
         private delegate void InitDelegate(ref PlatformContext ctx);
@@ -627,7 +651,27 @@ namespace CanKit.Core.Utils
             var deltaFromT0 = target - ctx.t0;
             var targetMono = Posix.Add(ctx.t0Mono, deltaFromT0);
 
-            try { Posix.SleepUntilMonotonicAbs(targetMono); } catch { /*EINTR 可忽略*/ }
+            try
+            {
+                Posix.SleepUntilMonotonicAbs(targetMono);
+            }
+            catch (Exception ex)
+            {
+                // EINTR is already filtered out inside SleepUntilMonotonicAbs, so whatever
+                // reaches here is persistent (missing libc symbol, EINVAL, ...). Swallowing
+                // it silently would turn the pre-wait into a permanent no-op and make the
+                // loop send in a hot spin (the NFR-002 send-storm scenario, on Linux). Log
+                // once and pin this loop to the coarse sleeper instead.
+                if (!ctx.posixSleepWarned)
+                {
+                    ctx.posixSleepWarned = true;
+                    CanKitLogger.LogWarning(
+                        "SoftwarePeriodicTx: clock_nanosleep failed; falling back to coarse sleep for the rest of this loop.", ex);
+                }
+                ctx.policy.UseThreadSleep = true;
+                SleepCoarse(sw, target, token, policy.GuardMs);
+                return;
+            }
 
             // 如果早醒且非常接近目标，再做一次极短自旋
             if (policy.SpinBudgetUs > 0)

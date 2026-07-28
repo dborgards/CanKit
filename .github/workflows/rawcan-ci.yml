@@ -44,7 +44,7 @@ jobs:
         run: dotnet restore CanKitRawCan.slnf
 
       - name: Test (${{ matrix.tfm }})
-        run: dotnet test CanKitRawCan.slnf -c Release -f ${{ matrix.tfm }} --logger "trx;LogFileName=TestResults-${{ matrix.tfm }}.trx"
+        run: dotnet test CanKitRawCan.slnf -c Release -f ${{ matrix.tfm }} --filter "FullyQualifiedName~RawCan|FullyQualifiedName~TxConfirm|FullyQualifiedName~Virtual|FullyQualifiedName~Subscription|FullyQualifiedName~SoftwarePeriodicTx|FullyQualifiedName~PeriodicJitter|FullyQualifiedName~CanFrame" --logger "trx;LogFileName=TestResults-${{ matrix.tfm }}.trx"
 
       - name: Upload Test Results (${{ matrix.tfm }})
         if: always()
@@ -77,11 +77,45 @@ jobs:
         run: dotnet restore CanKitRawCan.slnf
 
       - name: Test (net8.0)
-        run: dotnet test CanKitRawCan.slnf -c Release -f net8.0 --logger "trx;LogFileName=TestResults.trx"
+        run: dotnet test CanKitRawCan.slnf -c Release -f net8.0 --filter "FullyQualifiedName~RawCan|FullyQualifiedName~TxConfirm|FullyQualifiedName~Virtual|FullyQualifiedName~Subscription|FullyQualifiedName~SoftwarePeriodicTx|FullyQualifiedName~PeriodicJitter|FullyQualifiedName~CanFrame" --logger "trx;LogFileName=TestResults.trx"
 
       - name: Upload Test Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-ubuntu
+          path: '**/TestResults.trx'
+
+  # macOS runner coverage per SRS NFR-002 (Virtual adapter only; no hardware/native drivers).
+  macos:
+    name: RawCan (macOS)
+    runs-on: macos-latest
+    env:
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Configure endpoints
+        run: |
+          set -e
+          echo "CANKIT_TEST_ADAPTERS=CanKit.Adapter.Virtual" >> "$GITHUB_ENV"
+
+      - name: Restore
+        run: dotnet restore CanKitRawCan.slnf
+
+      - name: Test (net8.0)
+        run: dotnet test CanKitRawCan.slnf -c Release -f net8.0 --filter "FullyQualifiedName~RawCan|FullyQualifiedName~TxConfirm|FullyQualifiedName~Virtual|FullyQualifiedName~Subscription|FullyQualifiedName~SoftwarePeriodicTx|FullyQualifiedName~PeriodicJitter|FullyQualifiedName~CanFrame" --logger "trx;LogFileName=TestResults.trx"
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-macos
           path: '**/TestResults.trx'
